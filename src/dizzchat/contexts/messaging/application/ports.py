@@ -10,8 +10,16 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from dizzchat.contexts.messaging.domain.conversation import ConversationId
+from dizzchat.contexts.messaging.domain.conversation import ConversationId, OwnerId
 from dizzchat.contexts.messaging.domain.message import Message, MessageContent, SenderId
+
+
+class ConversationAccess(Protocol):
+    """Asserts an owner may access a conversation, within its own read transaction."""
+
+    async def ensure(self, *, conversation_id: ConversationId, owner_id: OwnerId) -> None:
+        """Return normally if allowed, or raise a conversation domain error."""
+        ...
 
 
 class AssistantResponder(Protocol):

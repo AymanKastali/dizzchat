@@ -20,6 +20,10 @@ from dizzchat.contexts.identity.infrastructure.inbound.api.router import router 
 from dizzchat.contexts.messaging.infrastructure.inbound.api.errors import (
     register_messaging_error_handlers,
 )
+from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime import (
+    ConnectionManager,
+    ws_router,
+)
 from dizzchat.contexts.messaging.infrastructure.inbound.api.router import (
     router as conversations_router,
 )
@@ -45,6 +49,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     engine = create_engine(settings.database_url)
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
+    # Per-replica registry of live WebSocket connections (the local half of the fan-out).
+    app.state.connection_manager = ConnectionManager()
     try:
         yield
     finally:
@@ -72,6 +78,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(identity_router)
     app.include_router(conversations_router)
+    app.include_router(ws_router)
     return app
 
 
