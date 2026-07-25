@@ -1,22 +1,21 @@
 """FastAPI dependency wiring (the composition root for the Identity context).
 
 Turns request-scoped state (a DB session) and process singletons (hasher, token service, clock)
-into the use-case handlers, and resolves the authenticated principal from the access token.
+into the use-case handlers, and resolves the authenticated principal from the access token. The
+generic session/clock dependencies come from the shared kernel.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from dizzchat.config import Settings, get_settings
 from dizzchat.contexts.identity.application.errors import InvalidAccessToken
-from dizzchat.contexts.identity.application.ports import Clock, TokenService
+from dizzchat.contexts.identity.application.ports import TokenService
 from dizzchat.contexts.identity.application.services import (
     AuthenticateUser,
     RefreshAccessToken,
@@ -33,33 +32,14 @@ from dizzchat.contexts.identity.infrastructure.outbound.persistence import (
 from dizzchat.contexts.identity.infrastructure.outbound.security import (
     Argon2PasswordHasher,
     JwtTokenService,
-    SystemClock,
 )
+from dizzchat.shared.infrastructure.inbound.api.dependencies import ClockDep, SessionDep
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
-async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
-    """Yield a request-scoped session; commit on success, roll back on error."""
-    session_factory: async_sessionmaker[AsyncSession] = request.app.state.session_factory
-    async with session_factory() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-
-
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
-
-
 def get_password_hasher() -> PasswordHasher:
     return Argon2PasswordHasher()
-
-
-def get_clock() -> Clock:
-    return SystemClock()
 
 
 def get_token_service(settings: SettingsDep) -> TokenService:
@@ -71,7 +51,6 @@ def get_token_service(settings: SettingsDep) -> TokenService:
 
 
 HasherDep = Annotated[PasswordHasher, Depends(get_password_hasher)]
-ClockDep = Annotated[Clock, Depends(get_clock)]
 TokenServiceDep = Annotated[TokenService, Depends(get_token_service)]
 
 

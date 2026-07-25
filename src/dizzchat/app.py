@@ -13,6 +13,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from dizzchat.config import Settings, get_settings
+from dizzchat.contexts.conversations.infrastructure.inbound.api.errors import (
+    register_conversations_error_handlers,
+)
+from dizzchat.contexts.conversations.infrastructure.inbound.api.router import (
+    router as conversations_router,
+)
 from dizzchat.contexts.identity.infrastructure.inbound.api.errors import (
     register_identity_error_handlers,
 )
@@ -62,8 +68,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["*"],
     )
     register_identity_error_handlers(app)
+    register_conversations_error_handlers(app)
     app.include_router(health_router)
     app.include_router(identity_router)
+    app.include_router(conversations_router)
     return app
 
 

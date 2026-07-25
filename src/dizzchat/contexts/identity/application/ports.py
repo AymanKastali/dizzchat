@@ -1,13 +1,12 @@
 """Technical ports the Identity use cases depend on.
 
-Unlike the repository ports (which belong to the domain), these abstract infrastructure
-capabilities — token minting/validation and the wall clock. Concrete adapters live in
-``infrastructure/outbound``.
+Unlike the repository ports (which belong to the domain), these abstract an infrastructure
+capability — token minting/validation. Concrete adapters live in ``infrastructure/outbound``.
+The generic ``Clock`` port lives in ``shared/application``.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Protocol
 
 from dizzchat.contexts.identity.application.dto import AccessClaims, GeneratedRefreshToken
@@ -35,12 +34,4 @@ class TokenService(Protocol):
 
     def verify_refresh(self, secret: str, token_hash: str) -> bool:
         """Return whether ``secret`` matches ``token_hash`` (constant-time)."""
-        ...
-
-
-class Clock(Protocol):
-    """A source of the current time, injected so time-dependent logic stays testable."""
-
-    def now(self) -> datetime:
-        """Return the current timezone-aware UTC time."""
         ...
