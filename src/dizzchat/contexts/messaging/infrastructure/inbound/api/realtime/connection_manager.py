@@ -36,23 +36,49 @@ class Connection:
         async with self._lock:
             await self._websocket.send_json(frame)
 
+    async def close(self, code: int = 1001) -> None:
+        async with self._lock:
+            await self._websocket.close(code)
+
 
 class ConnectionManager:
-    """Tracks ``conversation_id -> live connections`` and broadcasts messages to them."""
+    """Tracks ``conversation_id -> live connections`` and broadcasts messages to them.
+
+    ``register``/``unregister`` report the 0<->1 transitions of a conversation's socket set so the
+    caller can drive Redis (un)subscription on the first join / last leave, and ``close_all`` drains
+    every live socket for a graceful shutdown.
+    """
 
     def __init__(self) -> None:
         self._connections: dict[ConversationId, set[Connection]] = {}
 
-    def register(self, conversation_id: ConversationId, connection: Connection) -> None:
-        self._connections.setdefault(conversation_id, set()).add(connection)
+    def register(self, conversation_id: ConversationId, connection: Connection) -> bool:
+        """Add a connection; return ``True`` if it is the first socket for this conversation."""
+        connections = self._connections.setdefault(conversation_id, set())
+        first = not connections
+        connections.add(connection)
+        return first
 
-    def unregister(self, conversation_id: ConversationId, connection: Connection) -> None:
+    def unregister(self, conversation_id: ConversationId, connection: Connection) -> bool:
+        """Remove a connection; return ``True`` if it was the last socket for this conversation."""
         connections = self._connections.get(conversation_id)
         if connections is None:
-            return
+            return False
         connections.discard(connection)
-        if not connections:
-            del self._connections[conversation_id]
+        if connections:
+            return False
+        del self._connections[conversation_id]
+        return True
+
+    async def close_all(self, code: int = 1001) -> None:
+        """Close every live socket (graceful-shutdown drain) and forget them all."""
+        for connections in list(self._connections.values()):
+            for connection in list(connections):
+                try:
+                    await connection.close(code)
+                except Exception:
+                    logger.warning("error closing a socket during drain", exc_info=True)
+        self._connections.clear()
 
     async def broadcast(self, conversation_id: ConversationId, message: Message) -> None:
         connections = self._connections.get(conversation_id)

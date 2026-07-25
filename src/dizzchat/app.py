@@ -22,22 +22,28 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.errors import (
 )
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime import (
     ConnectionManager,
+    ConversationRegistry,
     ws_router,
 )
 from dizzchat.contexts.messaging.infrastructure.inbound.api.router import (
     router as conversations_router,
 )
+from dizzchat.contexts.messaging.infrastructure.outbound.redis import (
+    RedisConversationSubscriber,
+    RedisMessageBroadcaster,
+)
 from dizzchat.logging import configure_logging
 from dizzchat.shared.infrastructure.inbound.api.health import router as health_router
 from dizzchat.shared.infrastructure.outbound.database import create_engine, create_session_factory
 from dizzchat.shared.infrastructure.outbound.migrations import run_migrations
+from dizzchat.shared.infrastructure.outbound.redis_client import create_redis_client
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    """Apply migrations, then open/close the shared DB engine and session factory."""
+    """Apply migrations, open the DB + Redis infrastructure, and drain it on shutdown."""
     # Alembic's runner is synchronous and opens its own event loop (env.py uses asyncio.run),
     # so run it in a worker thread rather than nesting it in this loop. Concurrent replicas
     # are serialized by an advisory lock (see migrations/env.py); a failure aborts startup.
@@ -49,11 +55,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     engine = create_engine(settings.database_url)
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
-    # Per-replica registry of live WebSocket connections (the local half of the fan-out).
-    app.state.connection_manager = ConnectionManager()
+
+    # Per-replica fan-out: the connection manager is the local delivery half; the subscriber pulls
+    # this replica's subscribed conversations off Redis into it; the broadcaster publishes; the
+    # registry ties a socket's local registration to Redis (un)subscription.
+    redis_client = create_redis_client(settings.redis_url)
+    app.state.redis = redis_client
+    connection_manager = ConnectionManager()
+    app.state.connection_manager = connection_manager
+    subscriber = RedisConversationSubscriber(redis_client, connection_manager)
+    await subscriber.start()
+    app.state.message_broadcaster = RedisMessageBroadcaster(redis_client)
+    app.state.conversation_registry = ConversationRegistry(connection_manager, subscriber)
     try:
         yield
     finally:
+        # Graceful shutdown (uvicorn routes SIGTERM here and stops accepting new connections):
+        # drain live sockets, stop the subscriber, close Redis, then dispose the DB pool.
+        try:
+            await asyncio.wait_for(
+                connection_manager.close_all(), timeout=settings.shutdown_drain_timeout_seconds
+            )
+        except TimeoutError:
+            logger.warning("socket drain timed out; shutting down anyway")
+        await subscriber.stop()
+        await redis_client.aclose()
         await engine.dispose()
 
 

@@ -2,8 +2,9 @@
 
 These are synchronous ``def`` tests: Starlette's ``TestClient`` drives the socket over its own
 portal, which must not be nested inside pytest-asyncio's event loop. The app is used *without* its
-lifespan (so migrations never run); the connection manager is set on ``app.state`` by hand and left
-un-overridden so real broadcasts reach the connected socket.
+lifespan (so migrations never run and no Redis is opened); delivery is wired locally by overriding
+the broadcaster and the conversation registry with a single real ``ConnectionManager`` and a no-op
+subscriber, so a message still reaches the connected socket without cross-replica fan-out.
 """
 
 from typing import Any
@@ -24,10 +25,15 @@ from dizzchat.contexts.messaging.domain.conversation import (
     ConversationNotFound,
     NotConversationOwner,
 )
-from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime import ConnectionManager
+from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime import (
+    ConnectionManager,
+    ConversationRegistry,
+)
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.dependencies import (
     provide_assistant_responder,
     provide_conversation_access,
+    provide_conversation_registry,
+    provide_message_broadcaster,
     provide_message_writer,
 )
 from tests.contexts.messaging.fakes import (
@@ -35,6 +41,7 @@ from tests.contexts.messaging.fakes import (
     FailingAssistantResponder,
     FailingUserWriter,
     FakeMessageWriter,
+    NoOpSubscriber,
 )
 
 _VALID_TOKEN = "valid-token"
@@ -87,9 +94,10 @@ def _build_app(
     settings: Settings | None = None,
 ) -> FastAPI:
     app = create_app()
-    # Lifespan is not run in these tests, so set the per-replica manager by hand (kept real so
-    # broadcasts reach the connected socket).
-    app.state.connection_manager = ConnectionManager()
+    # Lifespan is not run in these tests, so there is no Redis. A single real ``ConnectionManager``
+    # stands in as the broadcaster (local delivery) and backs the registry (with a no-op
+    # subscriber), so a message still reaches the connected socket without cross-replica fan-out.
+    manager = ConnectionManager()
     app.dependency_overrides[get_token_service] = lambda: tokens or FakeTokenService(user_id)
     app.dependency_overrides[provide_message_writer] = lambda: writer or FakeMessageWriter()
     app.dependency_overrides[provide_assistant_responder] = lambda: (
@@ -97,6 +105,10 @@ def _build_app(
     )
     app.dependency_overrides[provide_conversation_access] = lambda: (
         access or FakeConversationAccess()
+    )
+    app.dependency_overrides[provide_message_broadcaster] = lambda: manager
+    app.dependency_overrides[provide_conversation_registry] = lambda: ConversationRegistry(
+        manager, NoOpSubscriber()
     )
     if settings is not None:
         app.dependency_overrides[get_settings] = lambda: settings
