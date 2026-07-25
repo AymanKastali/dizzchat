@@ -1,7 +1,7 @@
 """FastAPI application factory and the composition root.
 
-Later slices wire concrete infrastructure adapters (DB pool, Redis pub/sub, the WebSocket
-connection manager) here, and manage their lifecycle in ``lifespan``.
+Later slices wire concrete infrastructure adapters (Redis pub/sub, the WebSocket connection
+manager) here, and manage their lifecycle in ``lifespan``.
 """
 
 import asyncio
@@ -13,23 +13,36 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from dizzchat.config import Settings, get_settings
+from dizzchat.contexts.identity.infrastructure.inbound.api.errors import (
+    register_identity_error_handlers,
+)
+from dizzchat.contexts.identity.infrastructure.inbound.api.router import router as identity_router
 from dizzchat.logging import configure_logging
-from dizzchat.shared.api.health import router as health_router
-from dizzchat.shared.infrastructure.migrations import run_migrations
+from dizzchat.shared.infrastructure.inbound.api.health import router as health_router
+from dizzchat.shared.infrastructure.outbound.database import create_engine, create_session_factory
+from dizzchat.shared.infrastructure.outbound.migrations import run_migrations
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    """Manage startup/shutdown of shared resources (added in later slices)."""
+    """Apply migrations, then open/close the shared DB engine and session factory."""
     # Alembic's runner is synchronous and opens its own event loop (env.py uses asyncio.run),
     # so run it in a worker thread rather than nesting it in this loop. Concurrent replicas
     # are serialized by an advisory lock (see migrations/env.py); a failure aborts startup.
     logger.info("applying database migrations")
     await asyncio.to_thread(run_migrations)
     logger.info("database migrations applied")
-    yield
+
+    settings = get_settings()
+    engine = create_engine(settings.database_url)
+    app.state.engine = engine
+    app.state.session_factory = create_session_factory(engine)
+    try:
+        yield
+    finally:
+        await engine.dispose()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -48,7 +61,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    register_identity_error_handlers(app)
     app.include_router(health_router)
+    app.include_router(identity_router)
     return app
 
 

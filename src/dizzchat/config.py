@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     database_url: str
     redis_url: str
 
+    # Signing key for access-token JWTs — required, no default, and must be kept secret.
+    # HS256 needs at least 32 bytes of key material; enforce it so a weak key fails fast.
+    jwt_secret_key: str = Field(min_length=32)
+    jwt_algorithm: str = "HS256"
+    access_token_ttl_seconds: int = 900  # 15 minutes — short-lived, per the brief.
+    refresh_token_ttl_seconds: int = 1_209_600  # 14 days.
+
     # JSON array in the environment, e.g. CORS_ALLOW_ORIGINS=["https://app.example.com"].
     # Empty by default: cross-origin access is opt-in per environment, never wildcard-by-default.
     cors_allow_origins: list[str] = Field(default_factory=list)

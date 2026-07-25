@@ -7,6 +7,8 @@ x-api-base: &api-base
     DATABASE_URL: postgresql+asyncpg://dizzchat:dizzchat@postgres:5432/dizzchat
     REDIS_URL: redis://redis:6379/0
     LOG_LEVEL: INFO
+    # Local/dev signing key only — real deployments must inject a strong secret.
+    JWT_SECRET_KEY: local-dev-secret-key-not-for-production-use-32b
   # Each replica applies migrations itself on startup (serialized by an advisory lock),
   # so there is no separate migration step to wait on.
   depends_on:
