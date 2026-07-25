@@ -23,19 +23,26 @@ _NOW = datetime(2024, 1, 1, tzinfo=UTC)
 
 
 class FakeSocket:
-    """Records the JSON frames sent to it."""
+    """Records the JSON frames sent to it and the close code it was closed with."""
 
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
+        self.closed_with: int | None = None
 
     async def send_json(self, data: dict[str, Any]) -> None:
         self.sent.append(data)
+
+    async def close(self, code: int) -> None:
+        self.closed_with = code
 
 
 class FailingSocket:
     """A socket whose send always fails, standing in for a dead connection."""
 
     async def send_json(self, data: dict[str, Any]) -> None:
+        raise RuntimeError("connection closed")
+
+    async def close(self, code: int) -> None:
         raise RuntimeError("connection closed")
 
 
@@ -52,6 +59,52 @@ def _message(message_id: int, conversation_id: ConversationId) -> Message:
 
 def _connection(socket: object) -> Connection:
     return Connection(cast(WebSocket, socket))
+
+
+def test_register_reports_only_the_first_socket_of_a_conversation() -> None:
+    manager = ConnectionManager()
+    conversation = ConversationId(uuid4())
+
+    assert manager.register(conversation, _connection(FakeSocket())) is True
+    assert manager.register(conversation, _connection(FakeSocket())) is False
+
+
+def test_unregister_reports_only_the_removal_of_the_last_socket() -> None:
+    manager = ConnectionManager()
+    conversation = ConversationId(uuid4())
+    first, second = _connection(FakeSocket()), _connection(FakeSocket())
+    manager.register(conversation, first)
+    manager.register(conversation, second)
+
+    assert manager.unregister(conversation, first) is False
+    assert manager.unregister(conversation, second) is True
+    assert manager.is_empty(conversation) is True
+
+
+async def test_close_all_closes_every_socket_across_conversations() -> None:
+    manager = ConnectionManager()
+    conversation_a, conversation_b = ConversationId(uuid4()), ConversationId(uuid4())
+    socket_a, socket_b = FakeSocket(), FakeSocket()
+    manager.register(conversation_a, _connection(socket_a))
+    manager.register(conversation_b, _connection(socket_b))
+
+    await manager.close_all(code=1001)
+
+    assert socket_a.closed_with == 1001
+    assert socket_b.closed_with == 1001
+    assert manager.is_empty(conversation_a) and manager.is_empty(conversation_b)
+
+
+async def test_close_all_survives_a_socket_that_fails_to_close() -> None:
+    manager = ConnectionManager()
+    conversation = ConversationId(uuid4())
+    alive = FakeSocket()
+    manager.register(conversation, _connection(FailingSocket()))
+    manager.register(conversation, _connection(alive))
+
+    await manager.close_all()
+
+    assert alive.closed_with == 1001  # the good socket was still closed
 
 
 async def test_broadcast_reaches_only_the_conversations_own_sockets() -> None:
