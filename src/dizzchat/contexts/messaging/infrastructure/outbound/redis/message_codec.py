@@ -13,6 +13,7 @@ from uuid import UUID
 
 from dizzchat.contexts.messaging.domain.conversation import ConversationId
 from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
     Message,
     MessageContent,
     MessageId,
@@ -23,6 +24,7 @@ from dizzchat.contexts.messaging.domain.message import (
 
 def encode(message: Message) -> bytes:
     """Serialize a message to the JSON bytes published on its conversation channel."""
+    client_message_id = message.client_message_id
     payload = {
         "id": message.id.value,
         "conversation_id": str(message.conversation_id.value),
@@ -30,6 +32,9 @@ def encode(message: Message) -> bytes:
         "role": message.role.value,
         "content": message.content.value,
         "created_at": message.created_at.isoformat(),
+        "client_message_id": str(client_message_id.value)
+        if client_message_id is not None
+        else None,
     }
     return json.dumps(payload).encode("utf-8")
 
@@ -38,6 +43,7 @@ def decode(data: bytes) -> Message:
     """Reconstruct a domain ``Message`` from the JSON bytes received on a conversation channel."""
     raw = json.loads(data)
     sender_id = raw["sender_id"]
+    client_message_id = raw["client_message_id"]
     return Message(
         id=MessageId(raw["id"]),
         conversation_id=ConversationId(UUID(raw["conversation_id"])),
@@ -45,4 +51,7 @@ def decode(data: bytes) -> Message:
         role=MessageRole(raw["role"]),
         content=MessageContent(raw["content"]),
         created_at=datetime.fromisoformat(raw["created_at"]),
+        client_message_id=ClientMessageId(UUID(client_message_id))
+        if client_message_id is not None
+        else None,
     )

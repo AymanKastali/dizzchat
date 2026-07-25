@@ -12,6 +12,7 @@ from dizzchat.contexts.messaging.domain.conversation import (
     OwnerId,
 )
 from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
     Message,
     MessageContent,
     MessageId,
@@ -91,6 +92,7 @@ class FakeMessageRepository:
         role: MessageRole,
         content: MessageContent,
         created_at: datetime,
+        client_message_id: ClientMessageId | None = None,
     ) -> Message:
         message = Message(
             id=MessageId(self._next_id),
@@ -99,10 +101,22 @@ class FakeMessageRepository:
             role=role,
             content=content,
             created_at=created_at,
+            client_message_id=client_message_id,
         )
         self._next_id += 1
         self._messages.append(message)
         return message
+
+    async def find_by_client_message_id(
+        self, conversation_id: ConversationId, client_message_id: ClientMessageId
+    ) -> Message | None:
+        for message in self._messages:
+            if (
+                message.conversation_id == conversation_id
+                and message.client_message_id == client_message_id
+            ):
+                return message
+        return None
 
     async def list_history(
         self,
@@ -115,6 +129,19 @@ class FakeMessageRepository:
         if before is not None:
             matches = [m for m in matches if m.id.value < before.value]
         matches.sort(key=lambda m: m.id.value, reverse=True)
+        return matches[:limit]
+
+    async def list_since(
+        self,
+        conversation_id: ConversationId,
+        *,
+        after: MessageId | None,
+        limit: int,
+    ) -> list[Message]:
+        matches = [m for m in self._messages if m.conversation_id == conversation_id]
+        if after is not None:
+            matches = [m for m in matches if m.id.value > after.value]
+        matches.sort(key=lambda m: m.id.value)
         return matches[:limit]
 
 
@@ -132,21 +159,40 @@ _FIXED_NOW = datetime(2024, 1, 1, tzinfo=UTC)
 
 
 class FakeMessageWriter:
-    """In-memory ``MessageWriter`` that records writes and assigns an incrementing id."""
+    """In-memory ``MessageWriter`` that records writes and assigns an incrementing id.
+
+    ``from_user`` honours ``client_message_id`` idempotency (a repeat key returns the existing
+    message with ``created=False``), mirroring the real adapter's dedupe.
+    """
 
     def __init__(self) -> None:
         self.written: list[Message] = []
         self._next_id = 1
+        self._by_client_id: dict[tuple[ConversationId, ClientMessageId], Message] = {}
 
     async def from_user(
-        self, *, conversation_id: ConversationId, sender_id: SenderId, content: MessageContent
-    ) -> Message:
-        return self._record(conversation_id, sender_id, MessageRole.USER, content)
+        self,
+        *,
+        conversation_id: ConversationId,
+        sender_id: SenderId,
+        content: MessageContent,
+        client_message_id: ClientMessageId | None = None,
+    ) -> tuple[Message, bool]:
+        if client_message_id is not None:
+            existing = self._by_client_id.get((conversation_id, client_message_id))
+            if existing is not None:
+                return existing, False
+        message = self._record(
+            conversation_id, sender_id, MessageRole.USER, content, client_message_id
+        )
+        if client_message_id is not None:
+            self._by_client_id[(conversation_id, client_message_id)] = message
+        return message, True
 
     async def from_assistant(
         self, *, conversation_id: ConversationId, content: MessageContent
     ) -> Message:
-        return self._record(conversation_id, None, MessageRole.ASSISTANT, content)
+        return self._record(conversation_id, None, MessageRole.ASSISTANT, content, None)
 
     def _record(
         self,
@@ -154,6 +200,7 @@ class FakeMessageWriter:
         sender_id: SenderId | None,
         role: MessageRole,
         content: MessageContent,
+        client_message_id: ClientMessageId | None,
     ) -> Message:
         message = Message(
             id=MessageId(self._next_id),
@@ -162,6 +209,7 @@ class FakeMessageWriter:
             role=role,
             content=content,
             created_at=_FIXED_NOW,
+            client_message_id=client_message_id,
         )
         self._next_id += 1
         self.written.append(message)
@@ -172,8 +220,13 @@ class FailingUserWriter(FakeMessageWriter):
     """A ``MessageWriter`` whose user write always fails, to exercise the DB-error path."""
 
     async def from_user(
-        self, *, conversation_id: ConversationId, sender_id: SenderId, content: MessageContent
-    ) -> Message:
+        self,
+        *,
+        conversation_id: ConversationId,
+        sender_id: SenderId,
+        content: MessageContent,
+        client_message_id: ClientMessageId | None = None,
+    ) -> tuple[Message, bool]:
         raise RuntimeError("database unavailable")
 
 
@@ -210,3 +263,19 @@ class NoOpSubscriber:
     async def subscribe(self, conversation_id: ConversationId) -> None: ...
 
     async def unsubscribe(self, conversation_id: ConversationId) -> None: ...
+
+
+class StubMessageReplayer:
+    """A ``MessageReplayer`` that returns a preset list and records the cursor it was asked for."""
+
+    def __init__(self, missed: list[Message] | None = None) -> None:
+        self._missed = missed or []
+        self.replayed_after: MessageId | None = None
+        self.calls = 0
+
+    async def replay_since(
+        self, *, conversation_id: ConversationId, after: MessageId | None
+    ) -> list[Message]:
+        self.calls += 1
+        self.replayed_after = after
+        return list(self._missed)

@@ -11,7 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from dizzchat.contexts.messaging.application.services import PostMessage
 from dizzchat.contexts.messaging.domain.conversation import ConversationId
-from dizzchat.contexts.messaging.domain.message import Message, MessageContent, SenderId
+from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
+    Message,
+    MessageContent,
+    SenderId,
+)
 from dizzchat.contexts.messaging.infrastructure.outbound.persistence.repositories import (
     SqlAlchemyConversationRepository,
     SqlAlchemyMessageRepository,
@@ -32,13 +37,17 @@ class SessionScopedMessageWriter:
         conversation_id: ConversationId,
         sender_id: SenderId,
         content: MessageContent,
-    ) -> Message:
+        client_message_id: ClientMessageId | None = None,
+    ) -> tuple[Message, bool]:
         async with self._session_factory() as session:
-            message = await self._post_message(session).from_user(
-                conversation_id=conversation_id, sender_id=sender_id, content=content
+            message, created = await self._post_message(session).from_user(
+                conversation_id=conversation_id,
+                sender_id=sender_id,
+                content=content,
+                client_message_id=client_message_id,
             )
             await session.commit()
-            return message
+            return message, created
 
     async def from_assistant(
         self,

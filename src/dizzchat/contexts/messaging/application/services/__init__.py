@@ -10,6 +10,7 @@ from .list_conversations import ListConversations
 from .message_exchange import MessageExchange
 from .post_message import PostMessage
 from .rename_conversation import RenameConversation
+from .replay_messages import ReplayMessages
 
 __all__ = [
     "CreateConversation",
@@ -20,4 +21,5 @@ __all__ = [
     "MessageExchange",
     "PostMessage",
     "RenameConversation",
+    "ReplayMessages",
 ]

@@ -11,7 +11,13 @@ from __future__ import annotations
 from typing import Protocol
 
 from dizzchat.contexts.messaging.domain.conversation import ConversationId, OwnerId
-from dizzchat.contexts.messaging.domain.message import Message, MessageContent, SenderId
+from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
+    Message,
+    MessageContent,
+    MessageId,
+    SenderId,
+)
 
 
 class ConversationAccess(Protocol):
@@ -54,8 +60,13 @@ class MessageWriter(Protocol):
         conversation_id: ConversationId,
         sender_id: SenderId,
         content: MessageContent,
-    ) -> Message:
-        """Persist and return a user message (raising if the sender may not post)."""
+        client_message_id: ClientMessageId | None = None,
+    ) -> tuple[Message, bool]:
+        """Persist a user message, or return the existing one for a duplicate ``client_message_id``.
+
+        Returns ``(message, created)``; ``created`` is ``False`` on an idempotent duplicate send.
+        Raises if the sender may not post.
+        """
         ...
 
     async def from_assistant(
@@ -65,4 +76,14 @@ class MessageWriter(Protocol):
         content: MessageContent,
     ) -> Message:
         """Persist and return an assistant message."""
+        ...
+
+
+class MessageReplayer(Protocol):
+    """Reads the messages a reconnecting client missed, within its own read transaction."""
+
+    async def replay_since(
+        self, *, conversation_id: ConversationId, after: MessageId | None
+    ) -> list[Message]:
+        """Return every message with ordering id above ``after``, oldest-first."""
         ...
