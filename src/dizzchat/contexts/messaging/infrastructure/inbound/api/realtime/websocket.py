@@ -36,8 +36,8 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.connection_
     Connection,
 )
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.dependencies import (
-    ConnectionManagerDep,
     ConversationAccessDep,
+    ConversationRegistryDep,
     MessageExchangeDep,
 )
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.protocol import (
@@ -58,7 +58,7 @@ async def conversation_ws(
     tokens: TokenServiceDep,
     access: ConversationAccessDep,
     exchange: MessageExchangeDep,
-    manager: ConnectionManagerDep,
+    registry: ConversationRegistryDep,
 ) -> None:
     await websocket.accept()
 
@@ -77,14 +77,14 @@ async def conversation_ws(
 
     connection = Connection(websocket)
     await connection.send(protocol.auth_ok())
-    manager.register(conversation, connection)
+    await registry.join(conversation, connection)
     sender_id = SenderId(claims.user_id.value)
     try:
         await _receive_loop(websocket, connection, conversation, sender_id, exchange, tokens, token)
     except WebSocketDisconnect:
         pass
     finally:
-        manager.unregister(conversation, connection)
+        await registry.leave(conversation, connection)
 
 
 async def _authenticate(

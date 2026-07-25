@@ -202,3 +202,11 @@ class RecordingBroadcaster:
 
     async def broadcast(self, conversation_id: ConversationId, message: Message) -> None:
         self.broadcasts.append((conversation_id, message))
+
+
+class NoOpSubscriber:
+    """A ``ConversationSubscriber`` that does nothing, for route tests that run without Redis."""
+
+    async def subscribe(self, conversation_id: ConversationId) -> None: ...
+
+    async def unsubscribe(self, conversation_id: ConversationId) -> None: ...
