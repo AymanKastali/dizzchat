@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # How long a freshly-opened WebSocket has to send its auth frame before it is closed (4401).
     ws_auth_timeout_seconds: float = 5.0
 
+    # Upper bound on the graceful-shutdown socket drain before the process exits anyway.
+    shutdown_drain_timeout_seconds: float = 10.0
+
     # JSON array in the environment, e.g. CORS_ALLOW_ORIGINS=["https://app.example.com"].
     # Empty by default: cross-origin access is opt-in per environment, never wildcard-by-default.
     cors_allow_origins: list[str] = Field(default_factory=list)
