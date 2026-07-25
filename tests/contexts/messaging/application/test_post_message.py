@@ -12,7 +12,12 @@ from dizzchat.contexts.messaging.domain.conversation import (
     NotConversationOwner,
     OwnerId,
 )
-from dizzchat.contexts.messaging.domain.message import MessageContent, MessageRole, SenderId
+from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
+    MessageContent,
+    MessageRole,
+    SenderId,
+)
 from tests.contexts.messaging.fakes import (
     FakeConversationRepository,
     FakeMessageRepository,
@@ -36,12 +41,13 @@ async def test_from_user_persists_a_user_message_from_the_owner() -> None:
     owner = OwnerId(uuid4())
     conversation_id = await _conversation_owned_by(conversations, owner)
 
-    message = await PostMessage(conversations, messages, FixedClock(_NOW)).from_user(
+    message, created = await PostMessage(conversations, messages, FixedClock(_NOW)).from_user(
         conversation_id=conversation_id,
         sender_id=SenderId(owner.value),
         content=MessageContent("hello"),
     )
 
+    assert created is True
     assert message.role is MessageRole.USER
     assert message.sender_id == SenderId(owner.value)
     assert message.content.value == "hello"
@@ -84,3 +90,45 @@ async def test_from_assistant_persists_an_assistant_message_without_a_sender() -
     assert message.role is MessageRole.ASSISTANT
     assert message.sender_id is None
     assert message.content.value == "echo"
+
+
+async def test_from_user_reports_created_for_a_new_client_message_id() -> None:
+    conversations, messages = FakeConversationRepository(), FakeMessageRepository()
+    owner = OwnerId(uuid4())
+    conversation_id = await _conversation_owned_by(conversations, owner)
+
+    message, created = await PostMessage(conversations, messages, FixedClock(_NOW)).from_user(
+        conversation_id=conversation_id,
+        sender_id=SenderId(owner.value),
+        content=MessageContent("hello"),
+        client_message_id=ClientMessageId(uuid4()),
+    )
+
+    assert created is True
+    assert message.client_message_id is not None
+
+
+async def test_from_user_is_idempotent_for_a_duplicate_client_message_id() -> None:
+    conversations, messages = FakeConversationRepository(), FakeMessageRepository()
+    owner = OwnerId(uuid4())
+    conversation_id = await _conversation_owned_by(conversations, owner)
+    post_message = PostMessage(conversations, messages, FixedClock(_NOW))
+    client_message_id = ClientMessageId(uuid4())
+
+    first, first_created = await post_message.from_user(
+        conversation_id=conversation_id,
+        sender_id=SenderId(owner.value),
+        content=MessageContent("hi"),
+        client_message_id=client_message_id,
+    )
+    second, second_created = await post_message.from_user(
+        conversation_id=conversation_id,
+        sender_id=SenderId(owner.value),
+        content=MessageContent("hi again"),
+        client_message_id=client_message_id,
+    )
+
+    assert first_created is True
+    assert second_created is False
+    assert second.id == first.id  # same server message, no second row
+    assert len(messages._messages) == 1

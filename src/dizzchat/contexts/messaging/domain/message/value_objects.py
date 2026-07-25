@@ -41,6 +41,16 @@ class SenderId:
 
 
 @dataclass(frozen=True, eq=True, slots=True)
+class ClientMessageId:
+    """A client-generated idempotency key for a send, unique per conversation."""
+
+    value: UUID
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+@dataclass(frozen=True, eq=True, slots=True)
 class MessageContent:
     """A message body, required to be non-empty."""
 

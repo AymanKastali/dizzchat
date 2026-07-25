@@ -8,7 +8,12 @@ from dizzchat.contexts.messaging.application.ports import (
     MessageWriter,
 )
 from dizzchat.contexts.messaging.domain.conversation import ConversationId
-from dizzchat.contexts.messaging.domain.message import Message, MessageContent, SenderId
+from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
+    Message,
+    MessageContent,
+    SenderId,
+)
 
 
 class MessageExchange:
@@ -36,11 +41,22 @@ class MessageExchange:
         conversation_id: ConversationId,
         sender_id: SenderId,
         content: MessageContent,
+        client_message_id: ClientMessageId | None = None,
     ) -> Message:
-        """Run the send flow, returning the persisted user message (for the ack)."""
-        user_message = await self._writer.from_user(
-            conversation_id=conversation_id, sender_id=sender_id, content=content
+        """Run the send flow, returning the persisted user message (for the ack).
+
+        A duplicate ``client_message_id`` returns the already-persisted user message without
+        re-broadcasting or generating a second assistant reply (idempotent send).
+        """
+        user_message, created = await self._writer.from_user(
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+            content=content,
+            client_message_id=client_message_id,
         )
+        if not created:
+            return user_message
+
         await self._broadcaster.broadcast(conversation_id, user_message)
 
         reply = await self._responder.reply_to(content)

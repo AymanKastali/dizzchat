@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from dizzchat.contexts.messaging.domain.conversation import ConversationId
 from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
     Message,
     MessageContent,
     MessageId,
@@ -23,6 +24,7 @@ _NOW = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
 def test_round_trip_preserves_a_user_message() -> None:
     conversation_id = ConversationId(uuid4())
     sender_id = SenderId(uuid4())
+    client_message_id = ClientMessageId(uuid4())
     message = Message(
         id=MessageId(7),
         conversation_id=conversation_id,
@@ -30,6 +32,7 @@ def test_round_trip_preserves_a_user_message() -> None:
         role=MessageRole.USER,
         content=MessageContent("hi"),
         created_at=_NOW,
+        client_message_id=client_message_id,
     )
 
     decoded = decode(encode(message))
@@ -40,6 +43,7 @@ def test_round_trip_preserves_a_user_message() -> None:
     assert decoded.role == MessageRole.USER
     assert decoded.content == MessageContent("hi")
     assert decoded.created_at == _NOW
+    assert decoded.client_message_id == client_message_id
 
 
 def test_round_trip_preserves_an_assistant_message_with_no_sender() -> None:
@@ -57,3 +61,4 @@ def test_round_trip_preserves_an_assistant_message_with_no_sender() -> None:
     assert decoded.sender_id is None
     assert decoded.role == MessageRole.ASSISTANT
     assert decoded.content == MessageContent("You said: hi")
+    assert decoded.client_message_id is None

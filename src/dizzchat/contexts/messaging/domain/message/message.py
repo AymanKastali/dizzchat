@@ -7,6 +7,7 @@ from datetime import datetime
 
 from dizzchat.contexts.messaging.domain.conversation import ConversationId
 from dizzchat.contexts.messaging.domain.message.value_objects import (
+    ClientMessageId,
     MessageContent,
     MessageId,
     MessageRole,
@@ -24,7 +25,9 @@ class Message:
     locks the conversation. An entity: equal by identity.
 
     ``sender_id`` is the authoring user for a ``USER`` message and ``None`` for an ``ASSISTANT``
-    message (the assistant is not an Identity user).
+    message (the assistant is not an Identity user). ``client_message_id`` is the client-supplied
+    idempotency key for a user send, and ``None`` for an assistant message or a send that carried
+    no key.
     """
 
     id: MessageId
@@ -33,6 +36,7 @@ class Message:
     role: MessageRole
     content: MessageContent
     created_at: datetime
+    client_message_id: ClientMessageId | None = None
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, Message) and other.id == self.id

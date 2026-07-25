@@ -18,6 +18,7 @@ from dizzchat.contexts.messaging.application.ports import (
     AssistantResponder,
     ConversationAccess,
     MessageBroadcaster,
+    MessageReplayer,
     MessageWriter,
 )
 from dizzchat.contexts.messaging.application.services import MessageExchange
@@ -27,6 +28,7 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.conversatio
 from dizzchat.contexts.messaging.infrastructure.outbound.assistant import MockAssistantResponder
 from dizzchat.contexts.messaging.infrastructure.outbound.persistence import (
     SessionScopedConversationAccess,
+    SessionScopedMessageReplayer,
     SessionScopedMessageWriter,
 )
 from dizzchat.shared.infrastructure.outbound import SystemClock
@@ -62,6 +64,11 @@ def provide_conversation_access(websocket: WebSocket) -> ConversationAccess:
     return SessionScopedConversationAccess(session_factory)
 
 
+def provide_message_replayer(websocket: WebSocket) -> MessageReplayer:
+    session_factory: async_sessionmaker[AsyncSession] = websocket.app.state.session_factory
+    return SessionScopedMessageReplayer(session_factory)
+
+
 def provide_message_exchange(
     writer: Annotated[MessageWriter, Depends(provide_message_writer)],
     responder: Annotated[AssistantResponder, Depends(provide_assistant_responder)],
@@ -72,3 +79,4 @@ def provide_message_exchange(
 
 MessageExchangeDep = Annotated[MessageExchange, Depends(provide_message_exchange)]
 ConversationAccessDep = Annotated[ConversationAccess, Depends(provide_conversation_access)]
+MessageReplayerDep = Annotated[MessageReplayer, Depends(provide_message_replayer)]

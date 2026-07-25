@@ -27,8 +27,10 @@ from dizzchat.contexts.messaging.domain.conversation import (
     OwnerId,
 )
 from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
     InvalidMessageContent,
     MessageContent,
+    MessageId,
     SenderId,
 )
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime import protocol
@@ -39,6 +41,7 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.dependencie
     ConversationAccessDep,
     ConversationRegistryDep,
     MessageExchangeDep,
+    MessageReplayerDep,
 )
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.protocol import (
     AuthFrame,
@@ -60,13 +63,14 @@ async def conversation_ws(
     access: ConversationAccessDep,
     exchange: MessageExchangeDep,
     registry: ConversationRegistryDep,
+    replayer: MessageReplayerDep,
 ) -> None:
     await websocket.accept()
 
     authenticated = await _authenticate(websocket, tokens, settings.ws_auth_timeout_seconds)
     if authenticated is None:
         return
-    claims, token = authenticated
+    claims, token, last_seen_seq = authenticated
 
     conversation = ConversationId(conversation_id)
     owner_id = OwnerId(claims.user_id.value)
@@ -90,17 +94,27 @@ async def conversation_ws(
 
     sender_id = SenderId(claims.user_id.value)
     try:
+        # Join above turned on live delivery, so no message can be missed (no gap). Replay then
+        # re-sends everything past the client's cursor. Delivery is at-least-once and NOT ordered at
+        # the seam: a live broadcast (always a higher seq, being newer) can interleave ahead of a
+        # lower-seq replay frame. The client must apply each seq at most once (a seen-set, not a
+        # high-water mark, which would drop the later lower-seq frames) and order by the seq each
+        # frame carries as ``id``.
+        await _replay_missed(connection, replayer, conversation, last_seen_seq)
         await _receive_loop(websocket, connection, conversation, sender_id, exchange, tokens, token)
     except WebSocketDisconnect:
         pass
+    except Exception:
+        logger.exception("error while serving the conversation socket")
+        await connection.close(code=_INTERNAL_ERROR_CLOSE)
     finally:
         await registry.leave(conversation, connection)
 
 
 async def _authenticate(
     websocket: WebSocket, tokens: TokenServiceDep, auth_timeout_seconds: float
-) -> tuple[AccessClaims, str] | None:
-    """Read and validate the first ``auth`` frame; return (claims, token) or close 4401."""
+) -> tuple[AccessClaims, str, int | None] | None:
+    """Validate the first ``auth`` frame; return (claims, token, last_seen_seq) or close 4401."""
     try:
         raw = await asyncio.wait_for(websocket.receive_json(), timeout=auth_timeout_seconds)
     except WebSocketDisconnect:
@@ -116,7 +130,29 @@ async def _authenticate(
     except (ValidationError, InvalidAccessToken):
         await websocket.close(code=_AUTH_FAILED_CLOSE)
         return None
-    return claims, frame.payload.token
+    return claims, frame.payload.token, frame.payload.last_seen_seq
+
+
+async def _replay_missed(
+    connection: Connection,
+    replayer: MessageReplayerDep,
+    conversation: ConversationId,
+    last_seen_seq: int | None,
+) -> None:
+    """Stream messages with ``seq > last_seen_seq``, oldest-first, alongside live delivery.
+
+    Only replays when the client supplied a cursor; a fresh connection (``None``) loads its history
+    over the REST endpoint instead. Sending ``last_seen_seq=0`` explicitly requests a full replay.
+    Live delivery is already active (the socket has joined), so replay frames may interleave with
+    live ones — see the at-least-once contract at the call site.
+    """
+    if last_seen_seq is None:
+        return
+    missed = await replayer.replay_since(
+        conversation_id=conversation, after=MessageId(last_seen_seq)
+    )
+    for message in missed:
+        await connection.send(protocol.message_new(message))
 
 
 async def _receive_loop(
@@ -142,6 +178,12 @@ async def _receive_loop(
             await connection.send(protocol.error("invalid message frame"))
             continue
 
+        client_message_id = (
+            ClientMessageId(frame.payload.client_message_id)
+            if frame.payload.client_message_id is not None
+            else None
+        )
+
         # Re-validate the token on every privileged action, so a socket never outlives its access
         # token (e.g. sends after it has expired).
         try:
@@ -152,7 +194,10 @@ async def _receive_loop(
 
         try:
             user_message = await exchange.exchange(
-                conversation_id=conversation, sender_id=sender_id, content=content
+                conversation_id=conversation,
+                sender_id=sender_id,
+                content=content,
+                client_message_id=client_message_id,
             )
         except Exception:
             # A DB or mock-AI failure must never drop the socket.

@@ -9,6 +9,7 @@ from dizzchat.contexts.messaging.domain.conversation import (
     OwnerId,
 )
 from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
     Message,
     MessageContent,
     MessageRepository,
@@ -40,19 +41,35 @@ class PostMessage:
         conversation_id: ConversationId,
         sender_id: SenderId,
         content: MessageContent,
-    ) -> Message:
-        """Persist a user message, after checking the sender owns the conversation."""
+        client_message_id: ClientMessageId | None = None,
+    ) -> tuple[Message, bool]:
+        """Persist a user message, or return the existing one for a duplicate client id.
+
+        Returns ``(message, created)``; ``created`` is ``False`` when ``client_message_id`` already
+        has a persisted message (idempotent send). The DB unique constraint is the backstop for a
+        concurrent double-send that races past this pre-flight check.
+        """
         conversation = await self._conversations.get(conversation_id)
         if conversation is None:
             raise ConversationNotFound(conversation_id)
         conversation.ensure_owned_by(OwnerId(sender_id.value))
-        return await self._messages.create(
+
+        if client_message_id is not None:
+            existing = await self._messages.find_by_client_message_id(
+                conversation_id, client_message_id
+            )
+            if existing is not None:
+                return existing, False
+
+        message = await self._messages.create(
             conversation_id=conversation_id,
             sender_id=sender_id,
             role=MessageRole.USER,
             content=content,
             created_at=self._clock.now(),
+            client_message_id=client_message_id,
         )
+        return message, True
 
     async def from_assistant(
         self,

@@ -6,7 +6,12 @@ import pytest
 
 from dizzchat.contexts.messaging.application.services import MessageExchange
 from dizzchat.contexts.messaging.domain.conversation import ConversationId
-from dizzchat.contexts.messaging.domain.message import MessageContent, MessageRole, SenderId
+from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
+    MessageContent,
+    MessageRole,
+    SenderId,
+)
 from tests.contexts.messaging.fakes import (
     CannedAssistantResponder,
     FailingAssistantResponder,
@@ -32,6 +37,32 @@ async def test_persists_and_broadcasts_the_user_message_then_the_assistant_reply
     assert [m.role for _, m in broadcaster.broadcasts] == [MessageRole.USER, MessageRole.ASSISTANT]
     assert all(cid == conversation_id for cid, _ in broadcaster.broadcasts)
     assert broadcaster.broadcasts[0][1] is user_message
+
+
+async def test_a_duplicate_send_returns_existing_without_re_broadcast_or_assistant_reply() -> None:
+    writer, broadcaster = FakeMessageWriter(), RecordingBroadcaster()
+    exchange = MessageExchange(writer, CannedAssistantResponder("echo"), broadcaster)
+    conversation_id, sender_id = ConversationId(uuid4()), SenderId(uuid4())
+    client_message_id = ClientMessageId(uuid4())
+
+    first = await exchange.exchange(
+        conversation_id=conversation_id,
+        sender_id=sender_id,
+        content=MessageContent("hi"),
+        client_message_id=client_message_id,
+    )
+    broadcaster.broadcasts.clear()
+    second = await exchange.exchange(
+        conversation_id=conversation_id,
+        sender_id=sender_id,
+        content=MessageContent("hi"),
+        client_message_id=client_message_id,
+    )
+
+    assert second.id == first.id  # same server message returned for the ack
+    # No second user row, no assistant turn (from_assistant would append), no re-broadcast.
+    assert [m.role for m in writer.written] == [MessageRole.USER, MessageRole.ASSISTANT]
+    assert broadcaster.broadcasts == []
 
 
 async def test_a_failing_assistant_leaves_the_user_message_persisted_and_broadcast() -> None:

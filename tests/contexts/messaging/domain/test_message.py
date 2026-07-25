@@ -7,6 +7,7 @@ import pytest
 
 from dizzchat.contexts.messaging.domain.conversation import ConversationId
 from dizzchat.contexts.messaging.domain.message import (
+    ClientMessageId,
     InvalidMessageContent,
     Message,
     MessageContent,
@@ -46,6 +47,31 @@ def _message(message_id: int) -> Message:
 def test_messages_are_equal_by_identity_not_fields() -> None:
     assert _message(1) == _message(1)
     assert _message(1) != _message(2)
+
+
+def test_client_message_id_is_equal_by_value() -> None:
+    value = uuid4()
+    assert ClientMessageId(value) == ClientMessageId(value)
+    assert str(ClientMessageId(value)) == str(value)
+
+
+def test_message_carries_an_optional_client_message_id() -> None:
+    cid = ClientMessageId(uuid4())
+    message = Message(
+        id=MessageId(1),
+        conversation_id=ConversationId(uuid4()),
+        sender_id=SenderId(uuid4()),
+        role=MessageRole.USER,
+        content=MessageContent("hi"),
+        created_at=_CREATED_AT,
+        client_message_id=cid,
+    )
+
+    assert message.client_message_id == cid
+
+
+def test_a_message_defaults_to_no_client_message_id() -> None:
+    assert _message(1).client_message_id is None
 
 
 def test_an_assistant_message_has_no_sender() -> None:
