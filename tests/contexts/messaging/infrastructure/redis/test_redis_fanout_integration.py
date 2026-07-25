@@ -47,13 +47,13 @@ def _connection(socket: FakeSocket) -> Connection:
     return Connection(cast(WebSocket, socket))
 
 
-def _message(conversation_id: ConversationId) -> Message:
+def _message(conversation_id: ConversationId, content: str = "hello across replicas") -> Message:
     return Message(
         id=MessageId(1),
         conversation_id=conversation_id,
         sender_id=SenderId(uuid4()),
         role=MessageRole.USER,
-        content=MessageContent("hello across replicas"),
+        content=MessageContent(content),
         created_at=datetime(2024, 1, 1, tzinfo=UTC),
     )
 
@@ -102,26 +102,31 @@ async def test_a_message_from_one_replica_reaches_a_socket_on_another(redis_url:
     assert frame_a["type"] == "message.new"  # loopback: the producing replica delivers locally too
 
 
-async def test_a_replica_without_a_local_socket_receives_nothing(redis_url: str) -> None:
-    conversation = ConversationId(uuid4())
-    other_conversation = ConversationId(uuid4())
+async def test_a_replica_only_receives_conversations_it_subscribed_to(redis_url: str) -> None:
+    subscribed = ConversationId(uuid4())
+    other = ConversationId(uuid4())
     client_pub = create_redis_client(redis_url)
-    client_idle = create_redis_client(redis_url)
-    manager_idle = ConnectionManager()
-    subscriber_idle = RedisConversationSubscriber(client_idle, manager_idle)
-    registry_idle = ConversationRegistry(manager_idle, subscriber_idle)
+    client_sub = create_redis_client(redis_url)
+    manager = ConnectionManager()
+    subscriber = RedisConversationSubscriber(client_sub, manager)
+    registry = ConversationRegistry(manager, subscriber)
     broadcaster = RedisMessageBroadcaster(client_pub)
 
-    idle_socket = FakeSocket()
+    socket = FakeSocket()
     try:
-        await subscriber_idle.start()
-        # The idle replica is subscribed only to a *different* conversation.
-        await registry_idle.join(other_conversation, _connection(idle_socket))
-        await broadcaster.broadcast(conversation, _message(conversation))
-        await asyncio.sleep(0.3)  # give any (wrongly) delivered frame time to arrive
-    finally:
-        await subscriber_idle.stop()
-        await client_pub.aclose()
-        await client_idle.aclose()
+        await subscriber.start()
+        await registry.join(subscribed, _connection(socket))
 
-    assert idle_socket.sent == []
+        # Publish to the un-subscribed conversation first, then to the subscribed one. Gating on
+        # the second (which must arrive) proves the first had its chance and was correctly dropped.
+        await broadcaster.broadcast(other, _message(other, content="should not arrive"))
+        await broadcaster.broadcast(subscribed, _message(subscribed, content="should arrive"))
+
+        frame = await _wait_for_frame(socket)
+    finally:
+        await subscriber.stop()
+        await client_pub.aclose()
+        await client_sub.aclose()
+
+    assert len(socket.sent) == 1  # only the subscribed conversation's message was delivered
+    assert frame["payload"]["content"] == "should arrive"

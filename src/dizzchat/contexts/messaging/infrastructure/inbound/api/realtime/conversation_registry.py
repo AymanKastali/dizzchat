@@ -39,11 +39,18 @@ class ConversationRegistry:
         """Register a socket; subscribe to the conversation if it is the first on this replica.
 
         Subscription is awaited before the caller enters its receive loop, so a message this socket
-        sends is guaranteed to loop back through Redis.
+        sends is guaranteed to loop back through Redis. If the subscribe fails, the local
+        registration is rolled back and the error re-raised — otherwise the conversation would be
+        left registered-but-unsubscribed, and no later join would ever retry the subscribe.
         """
         async with self._lock:
-            if self._manager.register(conversation_id, connection):
+            if not self._manager.register(conversation_id, connection):
+                return
+            try:
                 await self._subscriber.subscribe(conversation_id)
+            except Exception:
+                self._manager.unregister(conversation_id, connection)
+                raise
 
     async def leave(self, conversation_id: ConversationId, connection: Connection) -> None:
         """Remove a socket; unsubscribe from the conversation once no local socket needs it."""

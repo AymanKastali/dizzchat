@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 _AUTH_FAILED_CLOSE = 4401
 _FORBIDDEN_CLOSE = 4403
+_INTERNAL_ERROR_CLOSE = 1011
 
 
 async def conversation_ws(
@@ -77,7 +78,16 @@ async def conversation_ws(
 
     connection = Connection(websocket)
     await connection.send(protocol.auth_ok())
-    await registry.join(conversation, connection)
+    try:
+        await registry.join(conversation, connection)
+    except Exception:
+        # The fan-out subscription could not be established (e.g. Redis is down): fail closed
+        # rather than serve a socket that would silently miss cross-replica messages. join() has
+        # already rolled back its local registration, so there is nothing to leave.
+        logger.exception("failed to join conversation for fan-out")
+        await connection.close(code=_INTERNAL_ERROR_CLOSE)
+        return
+
     sender_id = SenderId(claims.user_id.value)
     try:
         await _receive_loop(websocket, connection, conversation, sender_id, exchange, tokens, token)

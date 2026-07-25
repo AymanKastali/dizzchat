@@ -2,8 +2,12 @@
 
 One subscriber runs per replica. It (un)subscribes to per-conversation channels as the replica's
 local sockets join and leave, and a single reader task decodes each received message and hands it
-to the local ``ConnectionManager`` for delivery. If the Redis connection drops, the reader
+to a local ``MessageBroadcaster`` for delivery. If the Redis connection drops, the reader
 reconnects with a short backoff and re-subscribes to the channels it still needs.
+
+redis-py does not support concurrent use of one pub/sub connection from multiple tasks, so a single
+lock serializes every touch of it: the reader's ``get_message`` as well as subscribe/unsubscribe/
+reconnect. The read timeout is kept short so a subscribe waits only briefly for an in-flight read.
 """
 
 from __future__ import annotations
@@ -11,19 +15,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from typing import Any
 
 from redis.asyncio import Redis
 
+from dizzchat.contexts.messaging.application.ports import MessageBroadcaster
 from dizzchat.contexts.messaging.domain.conversation import ConversationId
-from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.connection_manager import (
-    ConnectionManager,
-)
 from dizzchat.contexts.messaging.infrastructure.outbound.redis.channels import conversation_channel
 from dizzchat.contexts.messaging.infrastructure.outbound.redis.message_codec import decode
 
 logger = logging.getLogger(__name__)
 
-_READ_TIMEOUT_SECONDS = 1.0
+_READ_TIMEOUT_SECONDS = 0.2
 _IDLE_POLL_SECONDS = 0.05
 _RECONNECT_BACKOFF_SECONDS = 0.5
 
@@ -31,10 +34,10 @@ _RECONNECT_BACKOFF_SECONDS = 0.5
 class RedisConversationSubscriber:
     """Subscribes to conversation channels and delivers received messages to local sockets."""
 
-    def __init__(self, redis: Redis, connection_manager: ConnectionManager) -> None:
+    def __init__(self, redis: Redis, local_broadcaster: MessageBroadcaster) -> None:
         self._redis = redis
         self._pubsub = redis.pubsub()
-        self._manager = connection_manager
+        self._local_broadcaster = local_broadcaster
         self._lock = asyncio.Lock()
         self._channels: set[str] = set()
         self._task: asyncio.Task[None] | None = None
@@ -80,9 +83,7 @@ class RedisConversationSubscriber:
                 await asyncio.sleep(_IDLE_POLL_SECONDS)
                 continue
             try:
-                message = await self._pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=_READ_TIMEOUT_SECONDS
-                )
+                message = await self._read_next()
             except Exception:
                 logger.warning("redis subscriber read failed; reconnecting", exc_info=True)
                 await self._reconnect()
@@ -91,13 +92,22 @@ class RedisConversationSubscriber:
                 continue
             await self._deliver(message["data"])
 
+    async def _read_next(self) -> dict[str, Any] | None:
+        # Under the lock so the reader never touches the pub/sub connection concurrently with
+        # subscribe/unsubscribe; the short timeout keeps that mutual exclusion brief.
+        async with self._lock:
+            message: dict[str, Any] | None = await self._pubsub.get_message(
+                ignore_subscribe_messages=True, timeout=_READ_TIMEOUT_SECONDS
+            )
+            return message
+
     async def _deliver(self, data: bytes) -> None:
         try:
             message = decode(data)
         except Exception:
             logger.exception("failed to decode a fanned-out message")
             return
-        await self._manager.broadcast(message.conversation_id, message)
+        await self._local_broadcaster.broadcast(message.conversation_id, message)
 
     async def _reconnect(self) -> None:
         await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
