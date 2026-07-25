@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .connection_manager import ConnectionManager
+from .connection_manager import Connection, ConnectionManager
 from .router import ws_router
 
-__all__ = ["ConnectionManager", "ws_router"]
+__all__ = ["Connection", "ConnectionManager", "ws_router"]

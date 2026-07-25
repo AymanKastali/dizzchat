@@ -14,7 +14,10 @@ from dizzchat.contexts.messaging.domain.message import (
     MessageRole,
     SenderId,
 )
-from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime import ConnectionManager
+from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime import (
+    Connection,
+    ConnectionManager,
+)
 
 _NOW = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -47,17 +50,17 @@ def _message(message_id: int, conversation_id: ConversationId) -> Message:
     )
 
 
-def _as_socket(socket: object) -> WebSocket:
-    return cast(WebSocket, socket)
+def _connection(socket: object) -> Connection:
+    return Connection(cast(WebSocket, socket))
 
 
 async def test_broadcast_reaches_only_the_conversations_own_sockets() -> None:
     manager = ConnectionManager()
     conversation_a, conversation_b = ConversationId(uuid4()), ConversationId(uuid4())
     socket_a1, socket_a2, socket_b = FakeSocket(), FakeSocket(), FakeSocket()
-    manager.register(conversation_a, _as_socket(socket_a1))
-    manager.register(conversation_a, _as_socket(socket_a2))
-    manager.register(conversation_b, _as_socket(socket_b))
+    manager.register(conversation_a, _connection(socket_a1))
+    manager.register(conversation_a, _connection(socket_a2))
+    manager.register(conversation_b, _connection(socket_b))
 
     await manager.broadcast(conversation_a, _message(1, conversation_a))
 
@@ -71,9 +74,9 @@ async def test_broadcast_reaches_only_the_conversations_own_sockets() -> None:
 async def test_a_dead_socket_is_dropped_and_does_not_block_the_others() -> None:
     manager = ConnectionManager()
     conversation = ConversationId(uuid4())
-    dead, alive = FailingSocket(), FakeSocket()
-    manager.register(conversation, _as_socket(dead))
-    manager.register(conversation, _as_socket(alive))
+    alive = FakeSocket()
+    manager.register(conversation, _connection(FailingSocket()))
+    manager.register(conversation, _connection(alive))
 
     await manager.broadcast(conversation, _message(1, conversation))
     assert len(alive.sent) == 1  # the live socket still received it
@@ -87,8 +90,9 @@ async def test_unregister_removes_a_socket_from_broadcasts() -> None:
     manager = ConnectionManager()
     conversation = ConversationId(uuid4())
     socket = FakeSocket()
-    manager.register(conversation, _as_socket(socket))
-    manager.unregister(conversation, _as_socket(socket))
+    connection = _connection(socket)
+    manager.register(conversation, connection)
+    manager.unregister(conversation, connection)
 
     await manager.broadcast(conversation, _message(1, conversation))
 

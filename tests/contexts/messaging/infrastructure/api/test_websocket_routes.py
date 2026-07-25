@@ -52,6 +52,20 @@ class FakeTokenService:
         return AccessClaims(user_id=UserId(self._user_id))
 
 
+class ExpiringTokenService:
+    """Valid at connect, then 'expires': every decode after the first is rejected."""
+
+    def __init__(self, user_id: UUID) -> None:
+        self._user_id = user_id
+        self._calls = 0
+
+    def decode_access(self, token: str) -> AccessClaims:
+        self._calls += 1
+        if self._calls > 1:
+            raise InvalidAccessToken()
+        return AccessClaims(user_id=UserId(self._user_id))
+
+
 class FakeConversationAccess:
     """Allows access unless constructed with an error to raise."""
 
@@ -66,6 +80,7 @@ class FakeConversationAccess:
 def _build_app(
     *,
     user_id: UUID,
+    tokens: Any = None,
     writer: Any = None,
     responder: Any = None,
     access: Any = None,
@@ -75,7 +90,7 @@ def _build_app(
     # Lifespan is not run in these tests, so set the per-replica manager by hand (kept real so
     # broadcasts reach the connected socket).
     app.state.connection_manager = ConnectionManager()
-    app.dependency_overrides[get_token_service] = lambda: FakeTokenService(user_id)
+    app.dependency_overrides[get_token_service] = lambda: tokens or FakeTokenService(user_id)
     app.dependency_overrides[provide_message_writer] = lambda: writer or FakeMessageWriter()
     app.dependency_overrides[provide_assistant_responder] = lambda: (
         responder or CannedAssistantResponder("You said: hi")
@@ -205,3 +220,17 @@ def test_a_failing_assistant_still_delivers_the_user_message_then_an_error() -> 
     assert user_new["type"] == "message.new"
     assert user_new["payload"]["role"] == "user"
     assert error["type"] == "error"
+
+
+def test_an_expired_token_closes_the_socket_on_the_next_send() -> None:
+    # Valid at connect, then the token 'expires'; the next privileged send must close 4401.
+    app = _build_app(user_id=uuid4(), tokens=ExpiringTokenService(uuid4()))
+    with (
+        pytest.raises(WebSocketDisconnect) as disconnect,
+        TestClient(app).websocket_connect(_url(uuid4())) as ws,
+    ):
+        ws.send_json(_auth_frame())
+        assert ws.receive_json() == {"type": "auth.ok"}
+        ws.send_json({"type": "message.send", "payload": {"content": "hi"}})
+        ws.receive_json()
+    assert disconnect.value.code == 4401

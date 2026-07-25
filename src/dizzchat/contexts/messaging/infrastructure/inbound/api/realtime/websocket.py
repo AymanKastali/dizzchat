@@ -32,6 +32,9 @@ from dizzchat.contexts.messaging.domain.message import (
     SenderId,
 )
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime import protocol
+from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.connection_manager import (
+    Connection,
+)
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.dependencies import (
     ConnectionManagerDep,
     ConversationAccessDep,
@@ -59,9 +62,10 @@ async def conversation_ws(
 ) -> None:
     await websocket.accept()
 
-    claims = await _authenticate(websocket, tokens, settings.ws_auth_timeout_seconds)
-    if claims is None:
+    authenticated = await _authenticate(websocket, tokens, settings.ws_auth_timeout_seconds)
+    if authenticated is None:
         return
+    claims, token = authenticated
 
     conversation = ConversationId(conversation_id)
     owner_id = OwnerId(claims.user_id.value)
@@ -71,21 +75,22 @@ async def conversation_ws(
         await websocket.close(code=_FORBIDDEN_CLOSE)
         return
 
-    await websocket.send_json(protocol.auth_ok())
-    manager.register(conversation, websocket)
+    connection = Connection(websocket)
+    await connection.send(protocol.auth_ok())
+    manager.register(conversation, connection)
     sender_id = SenderId(claims.user_id.value)
     try:
-        await _receive_loop(websocket, conversation, sender_id, exchange)
+        await _receive_loop(websocket, connection, conversation, sender_id, exchange, tokens, token)
     except WebSocketDisconnect:
         pass
     finally:
-        manager.unregister(conversation, websocket)
+        manager.unregister(conversation, connection)
 
 
 async def _authenticate(
     websocket: WebSocket, tokens: TokenServiceDep, auth_timeout_seconds: float
-) -> AccessClaims | None:
-    """Read and validate the first ``auth`` frame, or close 4401 and return ``None``."""
+) -> tuple[AccessClaims, str] | None:
+    """Read and validate the first ``auth`` frame; return (claims, token) or close 4401."""
     try:
         raw = await asyncio.wait_for(websocket.receive_json(), timeout=auth_timeout_seconds)
     except WebSocketDisconnect:
@@ -101,28 +106,39 @@ async def _authenticate(
     except (ValidationError, InvalidAccessToken):
         await websocket.close(code=_AUTH_FAILED_CLOSE)
         return None
-    return claims
+    return claims, frame.payload.token
 
 
 async def _receive_loop(
     websocket: WebSocket,
+    connection: Connection,
     conversation: ConversationId,
     sender_id: SenderId,
     exchange: MessageExchangeDep,
+    tokens: TokenServiceDep,
+    token: str,
 ) -> None:
     while True:
         try:
             raw = await websocket.receive_json()
         except ValueError:
-            await websocket.send_json(protocol.error("invalid JSON"))
+            await connection.send(protocol.error("invalid JSON"))
             continue
 
         try:
             frame = SendMessageFrame.model_validate(raw)
             content = MessageContent(frame.payload.content)
         except (ValidationError, InvalidMessageContent):
-            await websocket.send_json(protocol.error("invalid message frame"))
+            await connection.send(protocol.error("invalid message frame"))
             continue
+
+        # Re-validate the token on every privileged action, so a socket never outlives its access
+        # token (e.g. sends after it has expired).
+        try:
+            tokens.decode_access(token)
+        except InvalidAccessToken:
+            await websocket.close(code=_AUTH_FAILED_CLOSE)
+            return
 
         try:
             user_message = await exchange.exchange(
@@ -131,7 +147,7 @@ async def _receive_loop(
         except Exception:
             # A DB or mock-AI failure must never drop the socket.
             logger.exception("failed to handle message")
-            await websocket.send_json(protocol.error("failed to handle message"))
+            await connection.send(protocol.error("failed to handle message"))
             continue
 
-        await websocket.send_json(protocol.message_ack(user_message))
+        await connection.send(protocol.message_ack(user_message))
