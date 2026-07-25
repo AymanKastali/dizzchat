@@ -1,0 +1,68 @@
+# x-* keys are ignored by Compose — they exist purely to hold reusable anchors.
+# Both replicas share everything except their published host port.
+x-api-base: &api-base
+  build: .
+  image: dizzchat-api
+  environment:
+    DATABASE_URL: postgresql+asyncpg://dizzchat:dizzchat@postgres:5432/dizzchat
+    REDIS_URL: redis://redis:6379/0
+    LOG_LEVEL: INFO
+  # Each replica applies migrations itself on startup (serialized by an advisory lock),
+  # so there is no separate migration step to wait on.
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "python",
+        "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+      ]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dizzchat
+      POSTGRES_PASSWORD: dizzchat
+      POSTGRES_DB: dizzchat
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dizzchat"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    <<: *api-base
+    ports:
+      - "8000:8000"
+
+  # Second replica on :8001, sharing Postgres + Redis for cross-instance fan-out.
+  api2:
+    <<: *api-base
+    ports:
+      - "8001:8000"
+
+volumes:
+  pgdata:

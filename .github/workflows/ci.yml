@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # .pre-commit-config.yaml is the source of truth for these checks —
+      # running it here keeps CI and the local pre-commit hook identical.
+      - name: Run pre-commit checks
+        run: uv run pre-commit run --all-files --show-diff-on-failure

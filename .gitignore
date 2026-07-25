@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+
+# Editor
+.vscode/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local design notes
+docs/
