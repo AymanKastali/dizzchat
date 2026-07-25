@@ -24,6 +24,7 @@ from dizzchat.contexts.messaging.infrastructure.outbound.redis.message_codec imp
 logger = logging.getLogger(__name__)
 
 _READ_TIMEOUT_SECONDS = 1.0
+_IDLE_POLL_SECONDS = 0.05
 _RECONNECT_BACKOFF_SECONDS = 0.5
 
 
@@ -58,8 +59,10 @@ class RedisConversationSubscriber:
         """Start receiving a conversation's fanned-out messages on this replica."""
         channel = conversation_channel(conversation_id)
         async with self._lock:
-            self._channels.add(channel)
+            # Subscribe (which establishes the pub/sub connection) before recording the channel, so
+            # the reader never sees a channel it can read yet on a connection-less pub/sub.
             await self._pubsub.subscribe(channel)
+            self._channels.add(channel)
 
     async def unsubscribe(self, conversation_id: ConversationId) -> None:
         """Stop receiving a conversation's messages once no local socket needs them."""
@@ -70,6 +73,12 @@ class RedisConversationSubscriber:
 
     async def _run(self) -> None:
         while self._running:
+            # ``get_message`` errors on a pub/sub with no connection, which is the case until the
+            # first subscribe (and again if every channel is later dropped), so idle until there is
+            # something to read.
+            if not self._channels:
+                await asyncio.sleep(_IDLE_POLL_SECONDS)
+                continue
             try:
                 message = await self._pubsub.get_message(
                     ignore_subscribe_messages=True, timeout=_READ_TIMEOUT_SECONDS
