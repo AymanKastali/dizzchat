@@ -5,11 +5,12 @@ from __future__ import annotations
 from datetime import timedelta
 
 from dizzchat.contexts.identity.application.dto import TokenPair
-from dizzchat.contexts.identity.application.ports import Clock, TokenService
+from dizzchat.contexts.identity.application.ports import TokenService
 from dizzchat.contexts.identity.domain.refresh_token import (
     InvalidRefreshToken,
     RefreshTokenRepository,
 )
+from dizzchat.shared.application import Clock
 
 
 class RefreshAccessToken:

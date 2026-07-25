@@ -6,7 +6,7 @@ import asyncio
 from datetime import timedelta
 
 from dizzchat.contexts.identity.application.dto import TokenPair
-from dizzchat.contexts.identity.application.ports import Clock, TokenService
+from dizzchat.contexts.identity.application.ports import TokenService
 from dizzchat.contexts.identity.domain.refresh_token import RefreshToken, RefreshTokenRepository
 from dizzchat.contexts.identity.domain.user import (
     Email,
@@ -15,6 +15,7 @@ from dizzchat.contexts.identity.domain.user import (
     PasswordHasher,
     UserRepository,
 )
+from dizzchat.shared.application import Clock
 
 
 class AuthenticateUser:

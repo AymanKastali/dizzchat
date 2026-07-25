@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from uuid import uuid4
 
-from dizzchat.contexts.identity.application.ports import Clock
 from dizzchat.contexts.identity.domain.user import (
     Email,
     EmailAlreadyRegistered,
@@ -14,6 +13,7 @@ from dizzchat.contexts.identity.domain.user import (
     UserId,
     UserRepository,
 )
+from dizzchat.shared.application import Clock
 
 
 class RegisterUser:
