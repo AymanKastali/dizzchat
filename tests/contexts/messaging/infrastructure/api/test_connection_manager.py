@@ -78,7 +78,8 @@ def test_unregister_reports_only_the_removal_of_the_last_socket() -> None:
 
     assert manager.unregister(conversation, first) is False
     assert manager.unregister(conversation, second) is True
-    assert manager.is_empty(conversation) is True
+    # The conversation is now empty: registering again reports a first socket.
+    assert manager.register(conversation, _connection(FakeSocket())) is True
 
 
 async def test_close_all_closes_every_socket_across_conversations() -> None:
@@ -92,7 +93,9 @@ async def test_close_all_closes_every_socket_across_conversations() -> None:
 
     assert socket_a.closed_with == 1001
     assert socket_b.closed_with == 1001
-    assert manager.is_empty(conversation_a) and manager.is_empty(conversation_b)
+    # Every conversation was forgotten: registering into either reports a first socket again.
+    assert manager.register(conversation_a, _connection(FakeSocket())) is True
+    assert manager.register(conversation_b, _connection(FakeSocket())) is True
 
 
 async def test_close_all_survives_a_socket_that_fails_to_close() -> None:

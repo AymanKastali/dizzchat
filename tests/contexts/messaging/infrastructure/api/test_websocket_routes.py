@@ -2,8 +2,9 @@
 
 These are synchronous ``def`` tests: Starlette's ``TestClient`` drives the socket over its own
 portal, which must not be nested inside pytest-asyncio's event loop. The app is used *without* its
-lifespan (so migrations never run); the connection manager is set on ``app.state`` by hand and left
-un-overridden so real broadcasts reach the connected socket.
+lifespan (so migrations never run and no Redis is opened); delivery is wired locally by overriding
+the broadcaster and the conversation registry with a single real ``ConnectionManager`` and a no-op
+subscriber, so a message still reaches the connected socket without cross-replica fan-out.
 """
 
 from typing import Any

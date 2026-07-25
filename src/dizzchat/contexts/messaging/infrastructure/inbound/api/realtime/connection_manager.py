@@ -70,10 +70,6 @@ class ConnectionManager:
         del self._connections[conversation_id]
         return True
 
-    def is_empty(self, conversation_id: ConversationId) -> bool:
-        """Whether no sockets remain for the conversation on this replica."""
-        return conversation_id not in self._connections
-
     async def close_all(self, code: int = 1001) -> None:
         """Close every live socket (graceful-shutdown drain) and forget them all."""
         for connections in list(self._connections.values()):
