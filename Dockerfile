@@ -24,5 +24,5 @@ RUN useradd --create-home --uid 1000 app \
 USER app
 
 EXPOSE 8000
-# Default: serve the app. The compose `migrate` service overrides this to apply migrations.
+# Serve the app; it applies pending migrations itself on startup (see the FastAPI lifespan).
 ENTRYPOINT ["dizzchat"]
