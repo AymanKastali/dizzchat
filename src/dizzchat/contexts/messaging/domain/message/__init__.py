@@ -5,7 +5,7 @@ from __future__ import annotations
 from .errors import InvalidMessageContent
 from .message import Message
 from .repository import MessageRepository
-from .value_objects import MessageContent, MessageId, SenderId
+from .value_objects import MessageContent, MessageId, MessageRole, SenderId
 
 __all__ = [
     "InvalidMessageContent",
@@ -13,5 +13,6 @@ __all__ = [
     "MessageContent",
     "MessageId",
     "MessageRepository",
+    "MessageRole",
     "SenderId",
 ]

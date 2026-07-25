@@ -7,9 +7,17 @@ invalid value raises a domain error rather than being constructed.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum, auto
 from uuid import UUID
 
 from dizzchat.contexts.messaging.domain.message.errors import InvalidMessageContent
+
+
+class MessageRole(StrEnum):
+    """Who authored a message: a human ``USER`` or the ``ASSISTANT``."""
+
+    USER = auto()
+    ASSISTANT = auto()
 
 
 @dataclass(frozen=True, eq=True, slots=True)

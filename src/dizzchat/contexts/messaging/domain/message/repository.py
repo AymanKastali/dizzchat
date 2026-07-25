@@ -15,6 +15,7 @@ from dizzchat.contexts.messaging.domain.message.message import Message
 from dizzchat.contexts.messaging.domain.message.value_objects import (
     MessageContent,
     MessageId,
+    MessageRole,
     SenderId,
 )
 
@@ -26,11 +27,15 @@ class MessageRepository(Protocol):
         self,
         *,
         conversation_id: ConversationId,
-        sender_id: SenderId,
+        sender_id: SenderId | None,
+        role: MessageRole,
         content: MessageContent,
         created_at: datetime,
     ) -> Message:
-        """Persist a new message, returning it with its store-assigned ``id`` (the ordering seq)."""
+        """Persist a new message, returning it with its store-assigned ``id`` (the ordering seq).
+
+        ``sender_id`` is ``None`` for an ``ASSISTANT`` message.
+        """
         ...
 
     async def list_history(

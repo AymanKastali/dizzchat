@@ -9,6 +9,7 @@ from dizzchat.contexts.messaging.domain.conversation import ConversationId
 from dizzchat.contexts.messaging.domain.message.value_objects import (
     MessageContent,
     MessageId,
+    MessageRole,
     SenderId,
 )
 
@@ -21,11 +22,15 @@ class Message:
     history), so a ``Message`` instance always represents an already-persisted message. A
     separate aggregate from ``Conversation`` (referenced by id), so persisting a message never
     locks the conversation. An entity: equal by identity.
+
+    ``sender_id`` is the authoring user for a ``USER`` message and ``None`` for an ``ASSISTANT``
+    message (the assistant is not an Identity user).
     """
 
     id: MessageId
     conversation_id: ConversationId
-    sender_id: SenderId
+    sender_id: SenderId | None
+    role: MessageRole
     content: MessageContent
     created_at: datetime
 

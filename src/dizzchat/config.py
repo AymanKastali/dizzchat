@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     access_token_ttl_seconds: int = 900  # 15 minutes — short-lived, per the brief.
     refresh_token_ttl_seconds: int = 1_209_600  # 14 days.
 
+    # How long a freshly-opened WebSocket has to send its auth frame before it is closed (4401).
+    ws_auth_timeout_seconds: float = 5.0
+
     # JSON array in the environment, e.g. CORS_ALLOW_ORIGINS=["https://app.example.com"].
     # Empty by default: cross-origin access is opt-in per environment, never wildcard-by-default.
     cors_allow_origins: list[str] = Field(default_factory=list)

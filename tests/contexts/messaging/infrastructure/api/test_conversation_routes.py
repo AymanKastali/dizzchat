@@ -27,7 +27,7 @@ from dizzchat.contexts.messaging.domain.conversation import (
     ConversationTitle,
     OwnerId,
 )
-from dizzchat.contexts.messaging.domain.message import MessageContent, SenderId
+from dizzchat.contexts.messaging.domain.message import MessageContent, MessageRole, SenderId
 from dizzchat.contexts.messaging.infrastructure.inbound.api.dependencies import (
     provide_create_conversation,
     provide_delete_conversation,
@@ -176,6 +176,7 @@ async def test_history_is_cursor_paginated(ctx: _Context) -> None:
         await ctx.messages.create(
             conversation_id=conversation_id,
             sender_id=SenderId(ctx.caller_id),
+            role=MessageRole.USER,
             content=MessageContent(f"m{i}"),
             created_at=_NOW,
         )

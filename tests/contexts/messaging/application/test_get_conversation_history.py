@@ -16,7 +16,7 @@ from dizzchat.contexts.messaging.domain.conversation import (
     NotConversationOwner,
     OwnerId,
 )
-from dizzchat.contexts.messaging.domain.message import MessageContent, SenderId
+from dizzchat.contexts.messaging.domain.message import MessageContent, MessageRole, SenderId
 from tests.contexts.messaging.fakes import (
     FakeConversationRepository,
     FakeMessageRepository,
@@ -40,6 +40,7 @@ async def _seed(
         await messages.create(
             conversation_id=created.id,
             sender_id=sender,
+            role=MessageRole.USER,
             content=MessageContent(f"m{i}"),
             created_at=_NOW,
         )
