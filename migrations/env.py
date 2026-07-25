@@ -9,11 +9,11 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from dizzchat.config import get_settings
-from dizzchat.contexts.conversations.infrastructure.outbound.persistence import (  # noqa: F401
-    models as _conversations_models,
-)
 from dizzchat.contexts.identity.infrastructure.outbound.persistence import (  # noqa: F401
     models as _identity_models,
+)
+from dizzchat.contexts.messaging.infrastructure.outbound.persistence import (  # noqa: F401
+    models as _conversations_models,
 )
 from dizzchat.shared.infrastructure.outbound.database import Base
 
