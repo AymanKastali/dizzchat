@@ -12,6 +12,7 @@ from dizzchat.contexts.messaging.domain.message import (
     Message,
     MessageContent,
     MessageId,
+    MessageRole,
     SenderId,
 )
 from dizzchat.contexts.messaging.infrastructure.outbound.persistence.models import MessageModel
@@ -27,13 +28,15 @@ class SqlAlchemyMessageRepository:
         self,
         *,
         conversation_id: ConversationId,
-        sender_id: SenderId,
+        sender_id: SenderId | None,
+        role: MessageRole,
         content: MessageContent,
         created_at: datetime,
     ) -> Message:
         model = MessageModel(
             conversation_id=conversation_id.value,
-            sender_id=sender_id.value,
+            sender_id=sender_id.value if sender_id is not None else None,
+            role=role.value,
             content=content.value,
             created_at=created_at,
         )
@@ -61,7 +64,8 @@ def _to_domain(model: MessageModel) -> Message:
     return Message(
         id=MessageId(model.id),
         conversation_id=ConversationId(model.conversation_id),
-        sender_id=SenderId(model.sender_id),
+        sender_id=SenderId(model.sender_id) if model.sender_id is not None else None,
+        role=MessageRole(model.role),
         content=MessageContent(model.content),
         created_at=model.created_at,
     )

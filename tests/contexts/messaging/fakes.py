@@ -1,4 +1,4 @@
-"""In-memory fakes for the Conversations ports, shared by the application and API tests."""
+"""In-memory fakes for the Messaging ports, shared by the application and API tests."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from dizzchat.contexts.messaging.domain.message import (
     Message,
     MessageContent,
     MessageId,
+    MessageRole,
     SenderId,
 )
 
@@ -86,7 +87,8 @@ class FakeMessageRepository:
         self,
         *,
         conversation_id: ConversationId,
-        sender_id: SenderId,
+        sender_id: SenderId | None,
+        role: MessageRole,
         content: MessageContent,
         created_at: datetime,
     ) -> Message:
@@ -94,6 +96,7 @@ class FakeMessageRepository:
             id=MessageId(self._next_id),
             conversation_id=conversation_id,
             sender_id=sender_id,
+            role=role,
             content=content,
             created_at=created_at,
         )
