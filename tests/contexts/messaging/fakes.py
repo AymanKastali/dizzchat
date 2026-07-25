@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 
 from dizzchat.contexts.messaging.domain.conversation import (
     Conversation,
@@ -126,3 +126,79 @@ class FixedClock:
 
     def now(self) -> datetime:
         return self._now
+
+
+_FIXED_NOW = datetime(2024, 1, 1, tzinfo=UTC)
+
+
+class FakeMessageWriter:
+    """In-memory ``MessageWriter`` that records writes and assigns an incrementing id."""
+
+    def __init__(self) -> None:
+        self.written: list[Message] = []
+        self._next_id = 1
+
+    async def from_user(
+        self, *, conversation_id: ConversationId, sender_id: SenderId, content: MessageContent
+    ) -> Message:
+        return self._record(conversation_id, sender_id, MessageRole.USER, content)
+
+    async def from_assistant(
+        self, *, conversation_id: ConversationId, content: MessageContent
+    ) -> Message:
+        return self._record(conversation_id, None, MessageRole.ASSISTANT, content)
+
+    def _record(
+        self,
+        conversation_id: ConversationId,
+        sender_id: SenderId | None,
+        role: MessageRole,
+        content: MessageContent,
+    ) -> Message:
+        message = Message(
+            id=MessageId(self._next_id),
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+            role=role,
+            content=content,
+            created_at=_FIXED_NOW,
+        )
+        self._next_id += 1
+        self.written.append(message)
+        return message
+
+
+class FailingUserWriter(FakeMessageWriter):
+    """A ``MessageWriter`` whose user write always fails, to exercise the DB-error path."""
+
+    async def from_user(
+        self, *, conversation_id: ConversationId, sender_id: SenderId, content: MessageContent
+    ) -> Message:
+        raise RuntimeError("database unavailable")
+
+
+class CannedAssistantResponder:
+    """An ``AssistantResponder`` that always returns the same reply."""
+
+    def __init__(self, reply: str = "canned reply") -> None:
+        self._reply = reply
+
+    async def reply_to(self, prompt: MessageContent) -> MessageContent:
+        return MessageContent(self._reply)
+
+
+class FailingAssistantResponder:
+    """An ``AssistantResponder`` that always fails, to exercise the AI-error path."""
+
+    async def reply_to(self, prompt: MessageContent) -> MessageContent:
+        raise RuntimeError("assistant unavailable")
+
+
+class RecordingBroadcaster:
+    """A ``MessageBroadcaster`` that records every broadcast for assertions."""
+
+    def __init__(self) -> None:
+        self.broadcasts: list[tuple[ConversationId, Message]] = []
+
+    async def broadcast(self, conversation_id: ConversationId, message: Message) -> None:
+        self.broadcasts.append((conversation_id, message))

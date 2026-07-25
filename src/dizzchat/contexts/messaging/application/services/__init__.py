@@ -7,6 +7,7 @@ from .delete_conversation import DeleteConversation
 from .ensure_conversation_access import EnsureConversationAccess
 from .get_conversation_history import GetConversationHistory
 from .list_conversations import ListConversations
+from .message_exchange import MessageExchange
 from .post_message import PostMessage
 from .rename_conversation import RenameConversation
 
@@ -16,6 +17,7 @@ __all__ = [
     "EnsureConversationAccess",
     "GetConversationHistory",
     "ListConversations",
+    "MessageExchange",
     "PostMessage",
     "RenameConversation",
 ]
