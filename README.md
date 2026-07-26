@@ -59,6 +59,19 @@ Health check:
 curl http://localhost:8000/health   # {"status":"ok"}
 ```
 
+Then see the whole thing work in one command:
+
+```bash
+uv run demo.py
+```
+
+That is the [Demo](#demo) below, automated — sign up, open a socket, send, watch the broadcast and
+the assistant reply, reconnect on the *other* replica and read history back. Nothing to install.
+
+If you would rather apply migrations yourself, the automatic run is idempotent, so the equivalent
+manual command is `uv run alembic upgrade head` (or `docker compose run --rm api alembic upgrade
+head`).
+
 ---
 
 ## Local development
@@ -379,8 +392,49 @@ clients, step by step — see
 
 ## Demo
 
-A full round-trip in [Postman](https://www.postman.com/), which speaks both HTTP and WebSocket — no
-extra tooling. Start the stack first (`docker compose up --build`).
+### Run it — one file, one command
+
+With the stack up, from a second terminal:
+
+```bash
+uv run demo.py
+```
+
+```
+dizzchat demo · the assignment's deliverable 5, end to end
+replica A http://localhost:8000   replica B http://localhost:8001
+
+  1  health          localhost:8000 and localhost:8001 both report ok
+  2  signup          alice-d90e34d2@demo.dizzchat created (201)
+  3  read-your-write login on the same connection, zero delay -> 200
+  4  conversation    "demo" created, id 35b7250d-7d1e-4aa8-8131-6cc3968f6f81
+  5  connect         auth.ok on localhost:8000
+  6  send            ack seq=31 · message.new user + assistant "You said: hello"
+  7  two replicas    alice sent on localhost:8000; bob received it on localhost:8001 via Redis
+  8  reconnect       last_seen_seq=0 on localhost:8001 replayed seq [31, 32, 33, 34]
+  9  history         GET /messages returned 4 messages, newest first
+ 10  idempotent      same client_message_id -> ack seq=31, history still 4
+
+10/10 steps passed
+```
+
+Every step asserts something and the exit code is non-zero if any fails, so it is a smoke test as
+well as a demo. There is nothing to install: a [PEP 723](https://peps.python.org/pep-0723/) header
+declares its one dependency and `uv run` fetches it into a throwaway environment — no `uv sync`, no
+project virtualenv. HTTP goes over a single keep-alive connection on purpose, which is what makes
+step 3 meaningful (see [Known issues](#known-issues)). Fresh emails are generated per run, so it is
+re-runnable against a live database.
+
+It also ships inside the image, if you would rather not have `uv` on the host:
+
+```bash
+docker compose exec -e DIZZCHAT_API_A=api:8000 -e DIZZCHAT_API_B=api2:8000 api python demo.py
+```
+
+### Or click through it manually
+
+The same round-trip in [Postman](https://www.postman.com/), which speaks both HTTP and WebSocket —
+no extra tooling. Start the stack first (`docker compose up --build`).
 
 ### 1. REST — auth and a conversation
 
@@ -490,6 +544,27 @@ Set `WS_RATE_LIMIT_MESSAGES: 3` and `WS_RATE_LIMIT_WINDOW_SECONDS: 10` under **b
    persisted.
 
 The full frame and close-code reference is in [WebSocket protocol](#websocket-protocol) above.
+
+---
+
+## Known issues
+
+Nothing outstanding. Every REST route, WebSocket frame, and close code documented above behaves as
+described, and `uv run demo.py` asserts the end-to-end path on every run.
+
+One real bug was found and fixed while preparing the handoff, recorded here because it is the kind of
+thing this section exists for:
+
+- **REST writes used to be acknowledged before they were durable.** The request-scoped session
+  committed in a FastAPI `yield` dependency's teardown, which unwinds *after* the response has been
+  sent, so a client that read straight back could be served a snapshot without its own write — an
+  intermittent `401 invalid credentials` on sign-up-then-log-in. The transaction boundary is now
+  `TransactionalRoute`, which commits before the response goes out; the ordering is asserted at the
+  raw ASGI level in `tests/shared/infrastructure/api/test_transactional_route.py`, and `demo.py`
+  step 3 exercises it live over one keep-alive connection. Full write-up in
+  [NOTES.md](./NOTES.md#rest-writes-were-acknowledged-before-they-were-durable).
+
+Everything in the next section is a deliberate scope decision, not a defect.
 
 ---
 

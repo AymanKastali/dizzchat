@@ -1,7 +1,32 @@
 # Notes — decisions & deferred work
 
 The decisions behind the real-time layer, the one requirement I read as ambiguous, an honest account of
-what I cut, and the follow-ups a production hardening pass would pick up. Nothing here is a known bug.
+what I cut, and the follow-ups a production hardening pass would pick up.
+
+## The short version
+
+- **Structure.** A DDD hexagonal modular monolith, one deployable run as two replicas. Two bounded
+  contexts — `identity` and `messaging` (which owns real-time delivery, because delivery is *how*
+  messages reach clients, not a separate domain) — plus a `shared/` kernel. Dependencies point inward:
+  the domain imports no framework.
+- **WebSocket auth: the first-message `auth` frame.** The token never reaches a URL or a log, rejection
+  is a diagnosable application close code (`4401` bad token, `4403` not a participant) where a handshake
+  rejection is only an HTTP status, and it gives `last_seen_seq` a home so reconnect replay costs one
+  round trip. The price: the socket is accepted before it is authenticated, bounded to 5s.
+- **Protocol.** `{"type", "payload"}` for data, `{"type": "error", "error"}` for failures. Two inbound
+  types only (`auth`, `message.send`). History is REST, not a socket frame — paginated reads are
+  request/response by nature, and the socket stays a pure live channel. The bigserial `id` *is* the
+  sequence number.
+- **What I'd do next**, in order: server-side exactly-once at the replay/live seam, bounded replay,
+  REST-side rate limiting (`/auth/login` is unthrottled), then retention + an audit trail for
+  delete/restore. Detail in [What I'd do next](#what-id-do-next).
+- **What I cut, and it costs something.** Reconnect replay is at-least-once and unordered at the seam,
+  so the client must dedupe — the sharpest edge here. Streamed replies and typing/presence are not
+  built. The rate limit is a fixed window and covers the socket only. Three of the four bonuses are
+  untaken. Full list with consequences in [What I cut](#what-i-cut-and-the-honest-cost).
+- **One bug found and fixed** during the handoff pass: REST writes were acknowledged before they were
+  durable. [Write-up below](#rest-writes-were-acknowledged-before-they-were-durable). Nothing else is
+  outstanding.
 
 ## How it's structured
 
@@ -136,6 +161,41 @@ see history — while keeping bulk reads off the live path.
 If the intent really was a push-on-join `history` frame, it's a small addition: the replay machinery
 already exists and would just need a `last_seen_seq: 0` default at join.
 
+## A bug I found, and the fix
+
+### REST writes were acknowledged before they were durable
+
+The symptom was an intermittent `401 invalid credentials` when a client signed up and logged in
+immediately. It only appeared from a client reusing one keep-alive connection; `curl` never reproduced
+it, because a fresh process per request supplied enough delay to hide it.
+
+The cause is where FastAPI runs the teardown of a `yield` dependency. In `request_response`, the
+*request* exit stack unwinds only after `await response(scope, receive, send)`, so a `commit` in
+`get_session`'s post-`yield` block ran **after the response bytes were already on the wire**. Every
+REST write returned before it was durable. Sign-up-then-log-in was just the visible case;
+create-conversation-then-read and add-participant-then-connect raced identically.
+
+**The fix is a route class, not a commit in each controller.** `TransactionalRoute` wraps the route
+handler, which runs in the window between producing the response and sending it, and commits there;
+`get_session` now only publishes the session on `request.state` and rolls back on error. Committing in
+each of the eight write controllers was the alternative — more obvious at each call site, but eight
+edits and a new endpoint would silently reinherit the bug.
+
+Two things were worth adding beyond the fix itself:
+
+- **The ordering is asserted, not assumed.** The test drives the ASGI app with a spy wrapped around
+  `send` and a session that records `commit`/`rollback` into the same log, then asserts on the
+  interleaving. A behavioural test could not see this — the response is correct either way; only the
+  order is wrong.
+- **The new failure mode is a boot failure.** Since `get_session` no longer commits, a router
+  registered without `route_class=TransactionalRoute` would return `2xx` and discard the write —
+  worse than the race it replaced. `assert_session_routes_are_transactional` runs in `create_app` and
+  refuses to start, naming the offending method and path.
+
+What I would still change: the WebSocket path commits per message in its own adapter, so there are now
+two transaction-boundary mechanisms in the codebase for two genuinely different lifecycles. That is
+defensible but worth a single named concept (an explicit unit of work) if a third caller ever appears.
+
 ## Deliberate decisions
 
 ### No domain events / CQRS / event sourcing
@@ -228,6 +288,28 @@ knowingly, and each line is the real consequence rather than a reassurance:
   either replica) and catch up with `last_seen_seq`. Redis pub/sub is also fire-and-forget, so a message
   published while Redis is down is committed to Postgres but never fanned out live — recovery is again
   reconnect + replay. This is why Postgres, not Redis, is the source of truth.
+
+## What I'd do next
+
+In the order I would actually pick them up, given another few days:
+
+1. **Close the exactly-once gap at the replay/live seam.** The one item that pushes real work onto
+   every client, so it buys the most. Buffer live frames during replay and release them in `seq` order.
+   [Detail](#server-side-exactly-once-at-the-replaylive-seam).
+2. **Bound replay.** Page it with a deadline and fall back to the REST history endpoint past a
+   threshold, so one long-absent client cannot monopolize a socket. [Detail](#bounded-replay-for-large-backlogs).
+3. **Rate limit the REST surface.** `/auth/login` is unthrottled today, so nothing slows a
+   password-guessing loop — the largest remaining security gap. This is request middleware keyed on the
+   caller, a different mechanism from the socket's per-frame check, reusing the same Redis counter.
+4. **Retention and an audit trail for delete/restore.** A purge after N days, and a record of who
+   deleted or restored what. `deleted_at` is a state flag, not a history.
+5. **Close live sockets when a participant is removed**, via a cross-replica `participant.removed`
+   publish that each replica turns into a close. Today access is checked at connect, so a removed
+   participant keeps receiving until they disconnect.
+6. **Gate the assistant on an `@ai` mention**, so a multi-user room is not answered three times.
+7. **Correlation ids on the REST path**, matching the `connection_id` the WebSocket path already logs.
+8. **Streamed replies and typing/presence**, the two untaken Req-3 nice-to-haves — in that order, since
+   streaming needs only chunk framing while presence needs cross-replica ephemeral state.
 
 ## Delivery-guarantee follow-ups (from the delivery-guarantees slice)
 

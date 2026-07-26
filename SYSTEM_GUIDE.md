@@ -131,6 +131,12 @@ Four containers come up (`docker-compose.yml`):
 
 Health check: `curl http://localhost:8000/health` → `{"status":"ok"}`.
 
+**See it work in one command:** `uv run demo.py` from a second terminal. It signs up, opens a socket,
+sends, checks the broadcast and the assistant reply, proves the cross-replica hop through Redis,
+reconnects on the other replica to replay, reads history back over REST, and checks idempotency — ten
+asserted steps, non-zero exit if any fails. A PEP 723 header declares its single dependency, so there
+is nothing to install and no project virtualenv involved.
+
 ### Locally with uv
 
 ```bash
@@ -334,6 +340,8 @@ src/dizzchat/
       application/clock.py            Clock port
       infrastructure/inbound/api/health.py         /health router
       infrastructure/inbound/api/dependencies.py   get_session/SessionDep, get_clock/ClockDep
+      infrastructure/inbound/api/transactional_route.py  commits before the response is sent, + the
+                                                         boot guard that every REST router uses it
       infrastructure/outbound/database.py          Base, create_engine, create_session_factory
       infrastructure/outbound/migrations.py        run_migrations (alembic upgrade head)
       infrastructure/outbound/redis_client.py      create_redis_client
@@ -692,7 +700,11 @@ Entry: `main.py:main` loads settings and calls `uvicorn.run("dizzchat.app:app", 
 `create_app()` (`app.py`), in order: configure logging → build `FastAPI(lifespan=lifespan)` → add
 CORS (credentials enabled only when `*` is **not** in the origin list) → register identity + messaging
 error handlers → include routers in order: `health_router`, `identity_router`, `conversations_router`,
-`ws_router`.
+`ws_router` → **assert every session-taking route is transactional**
+(`assert_session_routes_are_transactional`, see [§8.2](#82-rest-auth-auth)). That last step is a
+composition-root guard, not a formality: the REST commit lives on the router, so a router wired
+without `route_class=TransactionalRoute` would return `2xx` and discard its writes. It raises at boot
+instead, naming the method and path.
 
 `lifespan` on startup, in exact order:
 1. `await asyncio.to_thread(run_migrations)` — migrate **off the event loop**, advisory-lock
@@ -717,9 +729,20 @@ On shutdown: drain sockets via `connection_manager.close_all()` bounded by
 
 ### 8.2 REST auth (`/auth`)
 
-Router: prefix `/auth`; `POST /signup` (201), `POST /login`, `POST /refresh`, `GET /me`. Request
-sessions are request-scoped: `shared/.../api/dependencies.py:get_session` commits on success and
-rolls back on error, so use-cases just add to the session and let teardown commit.
+Router: prefix `/auth`; `POST /signup` (201), `POST /login`, `POST /refresh`, `GET /me`.
+
+**The transaction boundary.** Sessions are request-scoped:
+`shared/.../api/dependencies.py:get_session` opens one, publishes it on `request.state`, and rolls
+back on error — but it deliberately does **not** commit. The commit belongs to `TransactionalRoute`
+(`shared/.../api/transactional_route.py`), the `route_class` on both REST routers, which commits after
+the handler returns and *before* the response is sent. The distinction is load-bearing: FastAPI runs a
+`yield` dependency's teardown on the request exit stack, which unwinds only after
+`await response(scope, receive, send)`, so committing there acknowledges a write before it is durable
+and a client reading straight back can miss its own write. That was a real, intermittent `401` on
+sign-up-then-log-in; see [NOTES.md](./NOTES.md#rest-writes-were-acknowledged-before-they-were-durable).
+Use cases therefore just add to the session; nothing in the application layer knows about commits.
+(The WebSocket path is different by necessity — it outlives any request, so it commits per message in
+`SessionScopedMessageWriter`.)
 
 - **`POST /auth/signup` → 201** — `RegisterUser.execute`: build `Email` (→ 422 on bad shape);
   `get_by_email` duplicate check → `EmailAlreadyRegistered` (**409**); hashing off-loaded via
@@ -1050,10 +1073,16 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 ## 14. Testing strategy
 
 - **Layout mirrors the source.** `tests/` follows `contexts/{identity,messaging}` down through
-  `domain/`, `application/`, `infrastructure/{api,security,redis}`, plus root `tests/test_health.py`
-  and `tests/test_logging.py`.
-- **Scale.** 190 tests across 35 files. Heaviest: `test_conversation_routes.py` (24),
-  `test_websocket_routes.py` (18), `test_conversation.py` (15).
+  `domain/`, `application/`, `infrastructure/{api,security,redis}`, plus `tests/shared/` and root
+  `tests/test_health.py` and `tests/test_logging.py`.
+- **Scale.** 196 tests across 36 files. Heaviest: `test_conversation_routes.py` (24),
+  `test_websocket_routes.py` (19), `test_conversation.py` (15).
+- **One test asserts an ordering, not a behaviour.**
+  `tests/shared/infrastructure/api/test_transactional_route.py` drives the ASGI app with a spy wrapped
+  around `send` and a session recording `commit`/`rollback` into the same log, then asserts the commit
+  lands *before* `http.response.start`. A behavioural test cannot see this bug — the response body is
+  correct either way; only the order is wrong. It also covers rollback-before-error-response and the
+  boot guard that rejects a session route on a non-transactional router.
 - **The multi-user proof.**
   `test_websocket_routes.py::test_a_message_from_one_user_is_broadcast_to_every_other_user_in_the_conversation`
   drives **two sockets authenticated as two different users** on one conversation and asserts both
@@ -1107,6 +1136,12 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
   than a `4429` close (a burst shouldn't cost a legitimate client its connection), and allows the
   frame if Redis is unreachable — a protection, not an authorization rule. Accepted flaw: a fixed
   window permits `2 * limit` across a boundary; a sliding window buys precision this doesn't need.
+- **The REST transaction boundary is a route class, not a commit per controller.** `TransactionalRoute`
+  commits after the handler and before the response is sent, because a `yield` dependency's teardown
+  runs *after* the response has gone out — which made every REST write acknowledged-before-durable.
+  Committing in each of the eight write controllers was the alternative: more obvious at the call site,
+  but a ninth endpoint would silently reinherit the bug. The cost of the route-class choice is that
+  forgetting `route_class` loses the commit entirely, so `create_app` asserts against that at boot.
 
 **Deferred (production-hardening follow-ups, from `NOTES.md`):**
 - **Server-side exactly-once at the replay/live seam** — buffer live frames during replay and
@@ -1161,6 +1196,11 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 - *How is flooding prevented?* → [§8.6](#86-rate-limiting) for the algorithm and its wiring,
   [§11](#11-security-model) for what it does and doesn't cover.
 - *What are the delivery guarantees?* → [§10](#10-delivery-guarantees).
+- *When is a write actually durable?* → [§8.2](#82-rest-auth-auth) for the REST transaction boundary
+  (`TransactionalRoute` commits before the response is sent),
+  [§8.4](#84-websocket-lifecycle-wsconversationsid--the-core) for the socket's per-message commit.
+- *How do I see it work end to end?* → `uv run demo.py` against a live stack — ten asserted steps
+  including the cross-replica hop; the click-through version is in [README](./README.md#demo).
 - *What's in the database?* → [§7](#7-database-schema); `migrations/versions/`.
 - *Where does X live in the code?* → [§5](#5-codebase-map).
 - *Why was X built this way / what's deferred?* → [§15](#15-key-decisions--trade-offs); `NOTES.md`.

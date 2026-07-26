@@ -48,7 +48,7 @@ select = ["E", "F", "I", "UP", "B", "C4", "SIM", "ASYNC"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "demo.py"]
 mypy_path = "src"
 explicit_package_bases = true
 plugins = ["pydantic.mypy"]

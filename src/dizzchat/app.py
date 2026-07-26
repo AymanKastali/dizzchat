@@ -35,6 +35,9 @@ from dizzchat.contexts.messaging.infrastructure.outbound.redis import (
 )
 from dizzchat.logging import configure_logging
 from dizzchat.shared.infrastructure.inbound.api.health import router as health_router
+from dizzchat.shared.infrastructure.inbound.api.transactional_route import (
+    assert_session_routes_are_transactional,
+)
 from dizzchat.shared.infrastructure.outbound import SystemClock
 from dizzchat.shared.infrastructure.outbound.database import create_engine, create_session_factory
 from dizzchat.shared.infrastructure.outbound.migrations import run_migrations
@@ -115,6 +118,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(identity_router)
     app.include_router(conversations_router)
     app.include_router(ws_router)
+    # Composition-root guard: the commit lives in TransactionalRoute, so a router wired without it
+    # would drop its writes silently. Refuse to boot instead.
+    assert_session_routes_are_transactional(
+        health_router, identity_router, conversations_router, ws_router
+    )
     return app
 
 

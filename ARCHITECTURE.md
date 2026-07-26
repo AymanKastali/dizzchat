@@ -124,6 +124,16 @@ domain.
   replicas; over the limit the server replies with an `error` frame and keeps the socket open. The
   port (`realtime/rate_limit.py`) sits beside its consumer rather than in `application/ports.py` — it
   guards the transport, not a use case. It fails **open** if Redis is unreachable, deliberately.
+- **Transaction boundaries — two lifecycles, two mechanisms.** REST commits in `TransactionalRoute`,
+  a route class that wraps the handler and commits *before* the response is sent; the request-scoped
+  `get_session` dependency only publishes the session and rolls back on error. This is not stylistic:
+  a `yield` dependency's teardown unwinds after the response has gone out, so committing there
+  acknowledges a write before it is durable (see
+  [NOTES.md](./NOTES.md#rest-writes-were-acknowledged-before-they-were-durable)). A WebSocket outlives
+  any request, so the socket path instead commits one transaction per message in its own outbound
+  adapter (`SessionScopedMessageWriter`). Because the REST commit now lives on the router, a router
+  wired without `route_class` would silently discard writes — so `create_app` asserts at boot that
+  every session-taking route is transactional.
 - **Resilience:** mock-AI generation and each DB/Redis call are wrapped so a failure emits an
   `error` frame and is logged — never crashing the socket or worker. The mock reply is an `async`,
   non-blocking responder (no I/O) awaited inline in `MessageExchange`; the non-negotiable is that it
@@ -177,6 +187,9 @@ connect, so revoking it stops a user posting immediately.
 - **Rate limiting inside `MessageExchange`:** would place the rule in the core use case, but malformed
   frames never reach a use case, so garbage floods could not be counted. The check sits in the socket
   receive loop instead.
+- **Committing in each write controller** rather than in a route class: more obvious at the call site,
+  but it is eight edits and a ninth endpoint would silently reinherit the acknowledge-before-durable
+  bug. `route_class` covers every route on the router, including ones added later.
 
 ---
 
@@ -204,9 +217,11 @@ The system was built in seven slices, each independently testable and each leavi
    `last_seen_seq` reconnect replay. Tests: duplicate send → one row + ack; reconnect with stale
    `last_seen_seq` → missed messages replayed exactly, in order.
 7. **Deliverables + hardening.** `README.md` (setup/run/test + honest "what doesn't work"),
-   `NOTES.md` (structure, WS-auth + protocol rationale, next steps, self-critique), and a documented
-   Postman demo sequence (signup → socket → send → broadcast + assistant reply → idempotent resend →
-   cross-replica reconnect replay). Full ruff/mypy/pytest green.
+   `NOTES.md` (structure, WS-auth + protocol rationale, next steps, self-critique), a documented
+   Postman demo sequence, and `demo.py` — one file, one command, asserting the whole sequence
+   (signup → socket → send → broadcast + assistant reply → cross-replica fan-out → reconnect replay →
+   history → idempotent resend). Auditing the deliverables against the brief is also what surfaced and
+   fixed the acknowledge-before-durable bug. Full ruff/mypy/pytest green.
 
 ---
 
@@ -217,8 +232,9 @@ The system was built in seven slices, each independently testable and each leavi
 - **Test:** `uv run pytest` (unit + integration; Postgres/Redis via testcontainers or the compose)
 - **Lint:** `uv run ruff check .` · **Format:** `uv run ruff format --check .`
 - **Types:** `uv run mypy` (strict; config-driven)
-- **Manual proof:** the Postman sequence in the [README](./README.md#demo) — including the
-  two-replica Redis fan-out step.
+- **End-to-end proof:** `uv run demo.py` against a live stack — ten asserted steps including the
+  two-replica Redis fan-out, with the same sequence available to click through in Postman
+  ([README](./README.md#demo)).
 
 **Definition of done, met:** clean checkout → `docker compose up` brings the stack live; a client can
 sign up, open a socket, send a message, see the broadcast + mock assistant reply, reconnect and see
