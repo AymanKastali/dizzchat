@@ -283,34 +283,59 @@ that open one transaction per message rather than reusing a request-scoped sessi
 
 ## Demo
 
-A full round-trip using `curl` and [`websocat`](https://github.com/vi/websocat):
+A full round-trip in [Postman](https://www.postman.com/), which speaks both HTTP and WebSocket — no
+extra tooling. Start the stack first (`docker compose up --build`).
 
-```bash
-# 1. Sign up and log in.
-curl -sX POST localhost:8000/auth/signup \
-  -H 'content-type: application/json' \
-  -d '{"email":"demo@example.com","password":"<a-demo-password>"}'
+### 1. REST — auth and a conversation
 
-TOKEN=$(curl -sX POST localhost:8000/auth/login \
-  -H 'content-type: application/json' \
-  -d '{"email":"demo@example.com","password":"<a-demo-password>"}' | jq -r .access_token)
+Send these as HTTP requests (all bodies are JSON):
 
-# 2. Create a conversation.
-CID=$(curl -sX POST localhost:8000/conversations \
-  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"title":"demo"}' | jq -r .id)
+1. `POST http://localhost:8000/auth/signup` — body
+   `{"email":"demo@example.com","password":"demo-password-123"}`.
+2. `POST http://localhost:8000/auth/login` — same body → copy `access_token` from the response.
+3. `POST http://localhost:8000/conversations` — header `Authorization: Bearer <access_token>`, body
+   `{"title":"demo"}` → copy the conversation `id`.
 
-# 3. Open the socket, authenticate, and send a message.
-#    Expect: auth.ok, then message.ack + message.new(user) + message.new(assistant).
-{ echo "{\"type\":\"auth\",\"payload\":{\"token\":\"$TOKEN\"}}";
-  echo '{"type":"message.send","payload":{"content":"hello","client_message_id":"11111111-1111-1111-1111-111111111111"}}';
-  sleep 2; } | websocat "ws://localhost:8000/ws/conversations/$CID"
+### 2. WebSocket — send, broadcast, assistant reply
+
+In Postman: **New → WebSocket Request**, URL `ws://localhost:8000/ws/conversations/<id>`.
+
+The server closes the socket if the first `auth` frame doesn't arrive within 5s, so paste the `auth`
+frame into the message composer *before* clicking **Connect**, then **Send** it immediately. (Raise
+`WS_AUTH_TIMEOUT_SECONDS` in `docker-compose.yml` for a roomier manual demo.)
+
+1. Send the auth frame → expect `{"type":"auth.ok"}`:
+
+   ```json
+   {"type":"auth","payload":{"token":"<access_token>"}}
+   ```
+
+2. Send a message → expect `message.ack`, then `message.new` (your user message) and `message.new`
+   (the assistant's `"You said: hello"`):
+
+   ```json
+   {"type":"message.send","payload":{"content":"hello","client_message_id":"11111111-1111-1111-1111-111111111111"}}
+   ```
+
+### 3. Idempotent send
+
+Send the same `message.send` frame again (same `client_message_id`) → you get only a `message.ack`;
+no new row, no re-broadcast, no second assistant reply.
+
+### 4. Cross-replica reconnect replay (Redis fan-out)
+
+Open a **second** WebSocket Request to the *other* replica,
+`ws://localhost:8001/ws/conversations/<id>`, and send an `auth` frame carrying a replay cursor:
+
+```json
+{"type":"auth","payload":{"token":"<access_token>","last_seen_seq":0}}
 ```
 
-To see **idempotent send**, send the same `client_message_id` twice — the second yields only a
-`message.ack` (no new row, no re-broadcast). To see **reconnect replay**, reconnect with
-`"last_seen_seq": 0` in the `auth` payload and observe the missed `message.new` frames replayed in
-order — including cross-replica, by connecting the second time to `ws://localhost:8001`.
+After `auth.ok` the server replays the conversation's `message.new` frames. The messages were sent
+to replica `:8000` and read back from `:8001` — proving fan-out state is shared across replicas over
+Redis.
+
+The full frame and close-code reference is in [WebSocket protocol](#websocket-protocol) above.
 
 ---
 
