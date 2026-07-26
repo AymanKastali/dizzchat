@@ -1,5 +1,7 @@
 # dizzchat
 
+[![CI](https://github.com/AymanKastali/dizzchat/actions/workflows/ci.yml/badge.svg)](https://github.com/AymanKastali/dizzchat/actions/workflows/ci.yml)
+
 A real-time AI chat backend. Users sign up, open per-conversation WebSocket connections, and
 exchange messages with a bundled mock assistant that echoes the message back (`You said: …`) — no
 external LLM call.
@@ -10,7 +12,8 @@ replay, and are idempotent per client-supplied key.
 PostgreSQL · Redis pub/sub · JWT auth (argon2 password hashing) · Docker Compose.
 
 **Architecture:** a DDD hexagonal modular monolith with two bounded contexts — `identity` and
-`messaging` — plus a small shared kernel. See [Architecture](#architecture).
+`messaging` — plus a small shared kernel. See [Architecture](#architecture) below, or
+[SYSTEM_GUIDE.md](./SYSTEM_GUIDE.md) for a full deep-dive (design, decisions, flows, testing).
 
 ---
 
@@ -280,7 +283,17 @@ that open one transaction per message rather than reusing a request-scoped sessi
 
 ## Demo
 
-A full round-trip using `curl` and [`websocat`](https://github.com/vi/websocat):
+With the stack running (`docker compose up --build`), the whole round-trip — including the
+cross-replica bonus — runs in one command:
+
+```bash
+./demo.sh   # needs curl, jq, and websocat on PATH
+```
+
+It signs up, logs in, creates a conversation, sends a message on replica `:8000`, shows the
+idempotent resend, then reconnects to replica `:8001` and replays the missed messages via Redis.
+
+The same sequence by hand, using `curl` and [`websocat`](https://github.com/vi/websocat):
 
 ```bash
 # 1. Sign up and log in.

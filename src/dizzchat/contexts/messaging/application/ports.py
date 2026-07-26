@@ -3,7 +3,7 @@
 These abstract infrastructure capabilities the domain must not know about — a mock AI responder,
 local/Redis broadcast, and the transactional message writer. Concrete adapters live in
 ``infrastructure/outbound``. Keeping them behind ports lets the exchange flow be unit-tested with
-fakes and lets Slice 5 slot Redis in behind ``MessageBroadcaster`` unchanged.
+fakes, and lets the Redis broadcaster sit behind ``MessageBroadcaster`` unknown to the use cases.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """FastAPI application factory and the composition root.
 
-Later slices wire concrete infrastructure adapters (Redis pub/sub, the WebSocket connection
-manager) here, and manage their lifecycle in ``lifespan``.
+Concrete infrastructure adapters (Redis pub/sub, the WebSocket connection manager, the DB engine)
+are wired here, and their lifecycle is managed in ``lifespan``.
 """
 
 import asyncio

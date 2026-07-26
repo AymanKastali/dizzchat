@@ -1,8 +1,8 @@
 """Per-replica registry of live WebSocket connections, grouped by conversation.
 
-Implements the ``MessageBroadcaster`` port for local (in-process) delivery. In Slice 5 a Redis
-subscriber will call the same ``broadcast`` to fan a message out to every replica's local sockets;
-nothing else about this class changes.
+Implements the ``MessageBroadcaster`` port for local (in-process) delivery. The per-replica Redis
+subscriber calls the same ``broadcast`` to fan a message out to every replica's local sockets, so
+this class stays agnostic of where a message originated.
 """
 
 from __future__ import annotations
