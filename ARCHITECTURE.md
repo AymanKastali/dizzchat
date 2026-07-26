@@ -128,8 +128,8 @@ domain.
   a route class that wraps the handler and commits *before* the response is sent; the request-scoped
   `get_session` dependency only publishes the session and rolls back on error. This is not stylistic:
   a `yield` dependency's teardown unwinds after the response has gone out, so committing there
-  acknowledges a write before it is durable (see
-  [NOTES.md](./NOTES.md#rest-writes-were-acknowledged-before-they-were-durable)). A WebSocket outlives
+  acknowledges a write before it is durable (the bug this replaced is recorded in
+  [README.md § Known issues](./README.md#known-issues)). A WebSocket outlives
   any request, so the socket path instead commits one transaction per message in its own outbound
   adapter (`SessionScopedMessageWriter`). Because the REST commit now lives on the router, a router
   wired without `route_class` would silently discard writes — so `create_app` asserts at boot that
@@ -178,12 +178,12 @@ connect, so revoking it stops a user posting immediately.
   fallback.
 - **Self-service conversation join** (any authenticated user joins any conversation whose id they
   know): cheapest way to get multiple users into a room, but it reduces authorization to a capability
-  URL. Membership is owner-granted by email instead — argued in
-  [NOTES.md § Multi-user conversations](./NOTES.md#multi-user-conversations--the-reading-i-changed-my-mind-about).
+  URL. Membership is owner-granted by email instead — the ambiguity that led there is in
+  [NOTES.md](./NOTES.md#ambiguities-i-read-differently).
 - **Sliding-window rate limiting** (a Redis sorted set trimmed on every frame): exact, with no
   boundary burst, but it costs extra round trips and per-request cleanup for precision a 20-per-10s
   limit doesn't need. A fixed-window `INCR` on a self-expiring key was chosen instead; the 2×-across-a-
-  boundary flaw is stated in [NOTES.md](./NOTES.md#deliberate-decisions).
+  boundary flaw is stated in [NOTES.md](./NOTES.md#whats-built-and-an-honest-self-critique-of-what-i-cut).
 - **Rate limiting inside `MessageExchange`:** would place the rule in the core use case, but malformed
   frames never reach a use case, so garbage floods could not be counted. The check sits in the socket
   receive loop instead.

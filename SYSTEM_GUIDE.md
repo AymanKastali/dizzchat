@@ -739,7 +739,7 @@ the handler returns and *before* the response is sent. The distinction is load-b
 `yield` dependency's teardown on the request exit stack, which unwinds only after
 `await response(scope, receive, send)`, so committing there acknowledges a write before it is durable
 and a client reading straight back can miss its own write. That was a real, intermittent `401` on
-sign-up-then-log-in; see [NOTES.md](./NOTES.md#rest-writes-were-acknowledged-before-they-were-durable).
+sign-up-then-log-in, recorded in [README.md § Known issues](./README.md#known-issues).
 Use cases therefore just add to the session; nothing in the application layer knows about commits.
 (The WebSocket path is different by necessity — it outlives any request, so it commits per message in
 `SessionScopedMessageWriter`.)
