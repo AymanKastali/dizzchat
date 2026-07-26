@@ -14,8 +14,11 @@ from dizzchat.contexts.identity.infrastructure.inbound.api.controllers import (
     refresh,
     signup,
 )
+from dizzchat.shared.infrastructure.inbound.api.transactional_route import TransactionalRoute
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+# ``route_class`` makes the request the transaction boundary for every route registered below, so a
+# write is durable before the client is told it happened.
+router = APIRouter(prefix="/auth", tags=["auth"], route_class=TransactionalRoute)
 router.add_api_route("/signup", signup, methods=["POST"], status_code=status.HTTP_201_CREATED)
 router.add_api_route("/login", login, methods=["POST"])
 router.add_api_route("/refresh", refresh, methods=["POST"])

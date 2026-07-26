@@ -1,205 +1,40 @@
 # dizzchat — System Guide
 
-> **What this document is.** A single, self-contained deep-dive into how dizzchat actually works —
-> system design, decisions, tools, tech stack, and codebase — written against the **code that
-> shipped**, not an earlier plan. Read this end to end and you should be able to answer essentially
-> any question about the app.
+> **The *how*.** How the system actually behaves, written against the code that shipped, and the
+> source of truth where the docs disagree. Details cite the real file so you can jump to it. To run
+> it: [README.md](./README.md). Why it's shaped this way: [ARCHITECTURE.md](./ARCHITECTURE.md).
+> Scope decisions and self-critique: [NOTES.md](./NOTES.md).
 >
-> **Where to start.** Read [§8.0](#80-the-whole-flow-in-one-picture) first — six diagrams that trace
-> one message end to end. That gives you the shape of the system in a couple of minutes; everything
-> else here fills it in. [§16](#16-glossary--quick-answer-index) is a "where do I look to answer X"
-> index if you'd rather jump straight to a topic.
->
-> **The four docs.** [`README.md`](./README.md) — how to run it, plus the REST + WebSocket API
-> reference. [`ARCHITECTURE.md`](./ARCHITECTURE.md) — the decisions and what was ruled out (the *why*).
-> **This guide** — how the system actually behaves (the *how*), and the source of truth where the docs
-> disagree. [`NOTES.md`](./NOTES.md) — deliberate scope cuts and self-critique. Where a detail matters
-> here, it cites the real file as `path:line` so you can jump straight to the code.
-
-## Contents
-
-1. [What dizzchat is](#1-what-dizzchat-is)
-2. [Tech stack & why each choice](#2-tech-stack--why-each-choice)
-3. [Run & verify](#3-run--verify)
-4. [Architecture at a glance](#4-architecture-at-a-glance)
-5. [Codebase map](#5-codebase-map)
-6. [Domain model](#6-domain-model)
-7. [Database schema](#7-database-schema)
-8. [How it works — end-to-end flows](#8-how-it-works--end-to-end-flows)
-9. [Real-time protocol reference](#9-real-time-protocol-reference)
-10. [Delivery guarantees](#10-delivery-guarantees)
-11. [Security model](#11-security-model)
-12. [Concurrency & async correctness](#12-concurrency--async-correctness)
-13. [Resilience & failure semantics](#13-resilience--failure-semantics)
-14. [Testing strategy](#14-testing-strategy)
-15. [Key decisions & trade-offs](#15-key-decisions--trade-offs)
-16. [Glossary & quick-answer index](#16-glossary--quick-answer-index)
+> **Start at [§ 5](#5-how-a-message-flows)** — six diagrams trace one message end to end. Everything
+> else fills them in.
 
 ---
 
 ## 1. What dizzchat is
 
-dizzchat is a **real-time AI chat backend**. Authenticated users open a WebSocket per conversation
-and exchange messages with a bundled **mock assistant** that simply echoes the input back
-(`"You said: …"` — see `contexts/messaging/infrastructure/outbound/assistant/mock_assistant_responder.py:16`).
-There is **no external LLM call**: the assignment is about getting the backend right — auth,
-persistence, real-time delivery, cross-replica fan-out, and delivery guarantees — not about the
-model.
+A real-time AI chat backend. Authenticated users open a WebSocket per conversation and exchange
+messages with a bundled **mock assistant** that echoes the input back (`"You said: …"` —
+`messaging/infrastructure/outbound/assistant/mock_assistant_responder.py:16`). There is no external
+LLM call.
 
 A conversation holds **many participants**. Its owner invites others by email; from then on every
-message any participant sends is broadcast to **all** of them, on whichever replica their sockets
-happen to live.
+message any participant sends is broadcast to all of them, on whichever replica their sockets live.
 
-The system runs as **two identical API replicas** sharing one PostgreSQL database and one Redis
-instance. A message sent to a socket on replica A is delivered to sockets on replica B via **Redis
-pub/sub**. Messages **persist** in Postgres (they survive restarts), are **idempotent** per a
-client-supplied key, and are **replayed** on reconnect so a client that dropped off catches up.
-
-**Priorities the build optimized for** (from the assignment rubric): core works · real-time done
-right · data layer · code quality/types/async · security · honest write-up.
-
-**Non-negotiables the design holds to:** no blocking calls on the async event loop; no
-unauthenticated WebSocket access; no plaintext passwords or committed secrets; a failed AI/DB call
-never crashes the socket or the worker; history survives a restart; the app runs on a clean
-checkout.
+It runs as **two identical API replicas** sharing one PostgreSQL database and one Redis instance. A
+message sent to a socket on replica A reaches sockets on replica B via **Redis pub/sub**. Messages
+persist in Postgres (they survive restarts), are idempotent per a client-supplied key, and are
+replayed on reconnect so a client that dropped off catches up.
 
 ---
 
-## 2. Tech stack & why each choice
+## 2. Architecture & codebase map
 
-**Language/runtime:** Python **3.13+** (`pyproject.toml` `requires-python = ">=3.13"`;
-`.python-version` pins `3.13`). Fully `async`/`await`.
-
-### Runtime dependencies (from `pyproject.toml`)
-
-| Package | Floor | Role & why |
-|---|---|---|
-| `fastapi` | `>=0.115` | HTTP + WebSocket framework; Pydantic-native, ASGI, dependency injection. |
-| `uvicorn[standard]` | `>=0.32` | ASGI server that runs the app. |
-| `sqlalchemy[asyncio]` | `>=2.0` | Async ORM; mature async story + clean split of DB models from API DTOs (chosen over SQLModel for exactly that separation). |
-| `asyncpg` | `>=0.30` | Fast async PostgreSQL driver used by SQLAlchemy. |
-| `alembic` | `>=1.14` | Schema migrations, run automatically on boot. |
-| `pydantic` | `>=2.9` | Validation + serialization for API DTOs and value parsing. |
-| `pydantic-settings` | `>=2.6` | Typed config from environment / `.env`. |
-| `argon2-cffi` | `>=23.1` | Password hashing (argon2id). |
-| `pyjwt` | `>=2.9` | HS256 access-token signing/verification. |
-| `redis` | `>=8.0.1` | `redis.asyncio` client for cross-replica pub/sub fan-out. |
-
-### Dev dependencies & toolchain
-
-| Tool | Floor | Role |
-|---|---|---|
-| `uv` | — | Dependency & virtualenv manager; `uv.lock` is committed and installs are `--frozen`/`--locked`. |
-| `ruff` | `>=0.8` | Lint **and** format. Line length **100**, target `py313`, rules `E,F,I,UP,B,C4,SIM,ASYNC`. |
-| `mypy` | `>=1.13` | Types, **`strict = true`**, `pydantic.mypy` plugin, `migrations/` excluded. |
-| `pytest` | `>=8.3` | Tests, `asyncio_mode = "auto"`. |
-| `pytest-asyncio` | `>=0.24` | Async test support. |
-| `httpx` | `>=0.28` | Test HTTP client (via FastAPI/Starlette `TestClient`). |
-| `pre-commit` | `>=4.6.1` | Runs ruff/format/mypy/pytest on every commit and in CI. |
-| `testcontainers[redis]` | `>=4.15.0` | Spins up a real `redis:7-alpine` for the one fan-out integration test. |
-
-**Console entry point:** `dizzchat = "dizzchat.main:main"` (`pyproject.toml`). Running `dizzchat`
-serves `dizzchat.app:app` with uvicorn.
-
----
-
-## 3. Run & verify
-
-### With Docker (the intended path)
-
-```bash
-docker compose up --build
-```
-
-Four containers come up (`docker-compose.yml`):
-
-| Service | Image | Host port | Notes |
-|---|---|---|---|
-| `postgres` | `postgres:16-alpine` | 5432 | volume `pgdata`; healthcheck `pg_isready -U dizzchat` |
-| `redis` | `redis:7-alpine` | 6379 | pub/sub backbone; healthcheck `redis-cli ping` |
-| `api` | built from `Dockerfile` | 8000 | replica #1 |
-| `api2` | same image | 8001 | replica #2 — shares Postgres + Redis |
-
-- `api` and `api2` share config via a **YAML anchor** `x-api-base: &api-base` merged with
-  `<<: *api-base`. Both wait for `postgres` and `redis` to be healthy (`depends_on … service_healthy`).
-- **Migrations run automatically on boot.** There is no migration container; each replica runs
-  `alembic upgrade head` during app startup, serialized across replicas by a Postgres advisory lock
-  (details in [§7](#7-database-schema) and [§8](#8-how-it-works--end-to-end-flows)).
-- The `Dockerfile` is `python:3.13-slim`, installs with a pinned `uv` in two cached layers
-  (`uv sync --frozen --no-install-project --no-dev`, then `--no-dev`), runs as an unprivileged user
-  `app`, and has `ENTRYPOINT ["dizzchat"]`.
-
-Health check: `curl http://localhost:8000/health` → `{"status":"ok"}`.
-
-### Locally with uv
-
-```bash
-uv sync                       # install deps into .venv
-cp .env.example .env          # then edit (needs a reachable Postgres + Redis)
-uv run dizzchat               # run the app
-```
-
-### Verify commands
-
-```bash
-uv run pytest                 # tests
-uv run ruff check .           # lint
-uv run ruff format --check .  # formatting
-uv run mypy                   # types (strict)
-```
-
-CI (`.github/workflows/ci.yml`) does the same set via `uv run pre-commit run --all-files`.
-
-### Configuration (`src/dizzchat/config.py`)
-
-Settings load from env or `.env` via pydantic-settings; `get_settings()` is `@lru_cache`d.
-
-| Env var | Type | Default |
-|---|---|---|
-| `ENVIRONMENT` | str | `development` |
-| `LOG_LEVEL` | str | `INFO` |
-| `HOST` | str | `0.0.0.0` |
-| `PORT` | int | `8000` |
-| `DATABASE_URL` | str | **required** — async SQLAlchemy URL (`postgresql+asyncpg://…`) |
-| `REDIS_URL` | str | **required** |
-| `JWT_SECRET_KEY` | str | **required**, **min length 32** (a weak key fails fast at startup) |
-| `JWT_ALGORITHM` | str | `HS256` |
-| `ACCESS_TOKEN_TTL_SECONDS` | int | `900` (15 min) |
-| `REFRESH_TOKEN_TTL_SECONDS` | int | `1209600` (14 days) |
-| `WS_AUTH_TIMEOUT_SECONDS` | float | `5.0` |
-| `WS_RATE_LIMIT_MESSAGES` | int | `20` — inbound frames allowed per user per window; `0` disables |
-| `WS_RATE_LIMIT_WINDOW_SECONDS` | int | `10` |
-| `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | float | `10.0` |
-| `CORS_ALLOW_ORIGINS` | list[str] | `[]` (JSON array; credentials only for explicit origins, never `*`) |
-
-> **Gotcha:** `WS_AUTH_TIMEOUT_SECONDS`, the two `WS_RATE_LIMIT_*` knobs, and
-> `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` exist in `config.py` but are **not** listed in `.env.example`.
-> They fall back to their defaults unless you set them.
-> The `JWT_SECRET_KEY` in `docker-compose.yml` is a dev-only placeholder — inject a strong random
-> value anywhere real.
-
----
-
-## 4. Architecture at a glance
-
-dizzchat is a **DDD hexagonal modular monolith**: one deployable, run as N replicas, split into
-**two bounded contexts** plus a small **shared kernel**.
-
-- **`identity`** (supporting) — users, signup/login/refresh, JWT + argon2.
-- **`messaging`** (core) — conversations, messages, **and** the real-time WebSocket delivery layer.
-  This is where the differentiating work lives.
-- **`shared`** — the shared kernel: `Clock`, DB engine/session factory, migration runner, Redis
-  client factory, `/health`.
-
-> The older plan described *three* contexts (splitting "Conversations" from "Realtime Messaging").
-> In the shipped code they are **one** `messaging` context — real-time is *how* messages are
-> delivered, not a separate domain, so it lives inside `messaging` rather than as its own context.
-
-### Hexagonal layering (ports & adapters)
+A **DDD hexagonal modular monolith**: one deployable, run as N replicas, split into two bounded
+contexts — `identity` (supporting) and `messaging` (core, and where the real-time layer lives) — plus
+a `shared` kernel. The reasoning is in [ARCHITECTURE.md](./ARCHITECTURE.md); the mechanics are here.
 
 The dependency arrow points **inward**. The domain and application core depend on nothing external;
-infrastructure depends on the core by implementing the **ports** (interfaces) the core declares.
-Swapping Postgres, Redis, or the web framework touches only adapters — never the domain.
+infrastructure depends on the core by implementing the **ports** the core declares.
 
 ```
         ┌──────────────── inbound adapters (infrastructure) ────────────────┐
@@ -220,23 +55,14 @@ Swapping Postgres, Redis, or the web framework touches only adapters — never t
         └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Vocabulary as used here:
+- **Port** — a `Protocol`/ABC interface declared in `application` (or a repository port in `domain`).
+- **Adapter** — a concrete implementation. *Inbound* adapters (`api`) drive the app; *outbound* ones
+  (`infrastructure/outbound`) are driven by it.
+- **Composition root** — where adapters are wired into use-cases: split between the app
+  factory/lifespan (`app.py`, process-level singletons) and per-context `api/dependencies.py`
+  (per-request and per-socket wiring via FastAPI `Depends`).
 
-- **Port** — a `Protocol`/ABC interface declared in `application` (or a repository port in
-  `domain`). The core depends only on these abstractions.
-- **Adapter** — a concrete implementation of a port. *Inbound* adapters (`api`) drive the app;
-  *outbound* adapters (`infrastructure/outbound`) are driven by it (DB, Redis, JWT, argon2).
-- **Composition root** — the one place that wires concrete adapters into use-cases. Here it's split
-  between the app factory/lifespan (`app.py`, process-level singletons) and per-context
-  `api/dependencies.py` modules (per-request/per-socket wiring via FastAPI `Depends`).
-
-Each context repeats the same `domain / application / infrastructure(inbound|outbound)` shape.
-
----
-
-## 5. Codebase map
-
-Annotated tree of `src/dizzchat/`. One line = one responsibility.
+Each context repeats the same `domain / application / infrastructure(inbound|outbound)` shape:
 
 ```
 src/dizzchat/
@@ -245,169 +71,107 @@ src/dizzchat/
   config.py         pydantic-settings Settings + @lru_cache get_settings()
   logging.py        structured JSON logging + per-connection connection_id correlation (contextvar)
 
-  contexts/
-    identity/                         signup / login / refresh / JWT auth
-      domain/
-        errors.py                     IdentityError base
-        user/user.py                  User aggregate (registers, hashes via the port)
-        user/value_objects.py         Email (lowercased), PasswordHash, UserId
-        user/repository.py            UserRepository port (add, get_by_email)
-        user/password_hasher.py       PasswordHasher port (domain-owned)
-        user/errors.py                InvalidEmail, InvalidCredentials, EmailAlreadyRegistered
-        refresh_token/refresh_token.py RefreshToken aggregate (issue/is_active/revoke/rotate)
-        refresh_token/repository.py   RefreshTokenRepository port (add, get_by_jti, save)
-        refresh_token/errors.py       InvalidRefreshToken
-      application/
-        ports.py                      TokenService technical port
-        errors.py                     InvalidAccessToken
-        dto/                          AccessClaims, GeneratedRefreshToken, TokenPair
-        services/register_user.py     RegisterUser
-        services/authenticate_user.py AuthenticateUser
-        services/refresh_access_token.py RefreshAccessToken
-      infrastructure/
-        inbound/api/router.py         /auth router
-        inbound/api/dependencies.py   Identity DI (builds use-cases, get_current_user bearer auth)
-        inbound/api/authenticated_user.py AuthenticatedUser principal
-        inbound/api/errors.py         identity error -> HTTP status mapping
-        inbound/api/controllers/      signup, login, refresh, current_user
-        inbound/api/schemas/          request/response Pydantic DTOs
-        outbound/security/argon2_password_hasher.py   Argon2PasswordHasher
-        outbound/security/jwt_token_service.py        JwtTokenService (HS256 + opaque refresh)
-        outbound/persistence/models/                  user_model, refresh_token_model
-        outbound/persistence/repositories/            SQLAlchemy user + refresh repos
+  contexts/identity/                    signup / login / refresh / JWT auth
+    domain/user/                        User aggregate; Email, PasswordHash, UserId; UserRepository
+                                        + PasswordHasher ports; InvalidEmail, InvalidCredentials,
+                                        EmailAlreadyRegistered
+    domain/refresh_token/               RefreshToken aggregate (issue/is_active/revoke/rotate),
+                                        repository port, InvalidRefreshToken
+    application/                        TokenService port; AccessClaims / TokenPair DTOs;
+                                        RegisterUser, AuthenticateUser, RefreshAccessToken
+    infrastructure/inbound/api/         /auth router, controllers, schemas, DI (get_current_user),
+                                        error → HTTP status mapping
+    infrastructure/outbound/            Argon2PasswordHasher, JwtTokenService (HS256 + opaque
+                                        refresh), SQLAlchemy models + repositories
 
-    messaging/                        conversations + messages + realtime delivery
-      domain/
-        errors.py                     MessagingError base
-        conversation/conversation.py  Conversation aggregate (lifecycle + ensure_owned_by /
-                                      ensure_participant / add_participant / remove_participant)
-        conversation/value_objects.py ConversationId, OwnerId, ParticipantId, ConversationTitle
-        conversation/participant.py   Participant (read-side VO: id + joined_at)
-        conversation/repository.py    ConversationRepository port
-        conversation/errors.py        ConversationNotFound, NotConversationOwner,
-                                      NotConversationParticipant, ParticipantUserNotFound,
-                                      CannotRemoveConversationOwner, InvalidConversationTitle
-        message/message.py            Message aggregate (immutable record, id = seq)
-        message/value_objects.py      MessageRole, MessageId, SenderId, ClientMessageId, MessageContent
-        message/repository.py         MessageRepository port
-        message/errors.py             InvalidMessageContent
-      application/
-        ports.py                      ConversationAccess, UserDirectory, AssistantResponder,
-                                      MessageBroadcaster, MessageWriter, MessageReplayer
-        dto/message_page.py           MessagePage (items, next_cursor, has_more)
-        services/create_conversation.py, list_conversations.py, rename_conversation.py,
-                 delete_conversation.py (soft), restore_conversation.py (undelete),
-                 get_conversation_history.py (cursor paging),
-                 ensure_conversation_access.py, post_message.py, message_exchange.py,
-                 replay_messages.py,
-                 add_participant.py, list_participants.py, remove_participant.py
-      infrastructure/
-        inbound/api/router.py         /conversations REST router
-        inbound/api/dependencies.py   Conversations DI
-        inbound/api/errors.py         messaging error -> HTTP status mapping
-        inbound/api/controllers/      create/list/rename/delete/restore,
-                                      get_conversation_history,
-                                      add/list/remove_participant
-        inbound/api/schemas/          request/response DTOs
-        inbound/api/realtime/router.py       registers WS route /ws/conversations/{id}
-        inbound/api/realtime/websocket.py    the WS endpoint handler (the core flow)
-        inbound/api/realtime/protocol.py     inbound frame models + outbound frame builders
-        inbound/api/realtime/connection_manager.py  Connection + ConnectionManager (local delivery)
-        inbound/api/realtime/conversation_registry.py ConversationSubscriber port + ConversationRegistry
-        inbound/api/realtime/rate_limit.py   RateLimiter port (declared beside its consumer)
-        inbound/api/realtime/dependencies.py realtime DI wiring
-        outbound/assistant/mock_assistant_responder.py  MockAssistantResponder ("You said: …")
-        outbound/redis/channels.py            conversation_channel() -> "conv:{id}"
-        outbound/redis/message_codec.py       encode/decode a domain Message <-> JSON bytes
-        outbound/redis/redis_message_broadcaster.py  RedisMessageBroadcaster (PUBLISH only)
-        outbound/redis/redis_conversation_subscriber.py RedisConversationSubscriber (per-replica reader)
-        outbound/redis/redis_rate_limiter.py  RedisRateLimiter (per-user fixed-window counter)
-        outbound/identity/identity_user_directory.py  email -> user id (anti-corruption layer)
-        outbound/persistence/models/          conversation_model, conversation_participant_model,
-                                              message_model
-        outbound/persistence/repositories/    SQLAlchemy conversation + message repos
-        outbound/persistence/session_scoped_conversation_access.py   per-call UoW for access check
-        outbound/persistence/session_scoped_message_writer.py        per-message UoW writer
-        outbound/persistence/session_scoped_message_replayer.py      per-call UoW replayer
+  contexts/messaging/                   conversations + messages + realtime delivery
+    domain/conversation/                Conversation aggregate (lifecycle, ensure_owned_by /
+                                        ensure_participant / add_participant / remove_participant);
+                                        ConversationId, OwnerId, ParticipantId, ConversationTitle;
+                                        Participant read-side VO; repository port; errors
+    domain/message/                     Message aggregate (immutable, id = seq); MessageRole,
+                                        MessageId, SenderId, ClientMessageId, MessageContent;
+                                        repository port; InvalidMessageContent
+    application/ports.py                ConversationAccess, UserDirectory, AssistantResponder,
+                                        MessageBroadcaster, MessageWriter, MessageReplayer
+    application/services/               create/list/rename/delete/restore_conversation,
+                                        get_conversation_history, ensure_conversation_access,
+                                        post_message, message_exchange, replay_messages,
+                                        add/list/remove_participant
+    infrastructure/inbound/api/         /conversations router, controllers, schemas, DI, errors
+    …/api/realtime/websocket.py         the WS endpoint handler (the core flow)
+    …/api/realtime/protocol.py          inbound frame models + outbound frame builders
+    …/api/realtime/connection_manager.py        Connection + ConnectionManager (local delivery)
+    …/api/realtime/conversation_registry.py     ConversationSubscriber port + ConversationRegistry
+    …/api/realtime/rate_limit.py                RateLimiter port (declared beside its consumer)
+    infrastructure/outbound/assistant/  MockAssistantResponder ("You said: …")
+    infrastructure/outbound/redis/      channels (conv:{id}), message_codec, RedisMessageBroadcaster
+                                        (PUBLISH only), RedisConversationSubscriber (per-replica
+                                        reader), RedisRateLimiter (per-user fixed window)
+    infrastructure/outbound/identity/   IdentityUserDirectory — email → user id (anti-corruption)
+    infrastructure/outbound/persistence/ SQLAlchemy models + repositories, and the session-scoped
+                                        per-operation UoW adapters (access, message writer, replayer)
 
-    shared/                           the shared kernel
-      application/clock.py            Clock port
-      infrastructure/inbound/api/health.py         /health router
-      infrastructure/inbound/api/dependencies.py   get_session/SessionDep, get_clock/ClockDep
-      infrastructure/outbound/database.py          Base, create_engine, create_session_factory
-      infrastructure/outbound/migrations.py        run_migrations (alembic upgrade head)
-      infrastructure/outbound/redis_client.py      create_redis_client
-      infrastructure/outbound/system_clock.py      SystemClock (UTC)
+  shared/                               the shared kernel
+    application/clock.py                Clock port
+    infrastructure/inbound/api/         /health router; get_session/SessionDep, get_clock/ClockDep
+    infrastructure/outbound/            database (Base, engine, session factory), migrations runner,
+                                        redis_client, SystemClock (UTC)
 ```
 
 ---
 
-## 6. Domain model
+## 3. Domain model
 
-Aggregates are the consistency boundaries; **value objects** (VOs) are immutable, validate once at
-construction, and are equal by value. An invalid value raises a **domain error** instead of being
-constructed — so an invalid state is unrepresentable past the boundary.
+Aggregates are the consistency boundaries. **Value objects** are immutable, validate once at
+construction, and are equal by value — an invalid value raises a domain error instead of being
+constructed, so invalid state is unrepresentable past the boundary.
 
-### Identity
+**Identity.** `User` (`domain/user/user.py`) — `User.register(...)` hashes the password by
+double-dispatch through the `PasswordHasher` port, so the domain never imports argon2. `Email`
+normalizes to lowercase; `PasswordHash` is guaranteed to hold only a hash. `RefreshToken` is a
+persisted credential identified by `jti` that stores **only the hash** of its secret; `rotate` revokes
+the current token and mints a successor, raising `InvalidRefreshToken` if it isn't active — which is
+what rejects replay of a revoked or expired token.
 
-- **`User`** (`domain/user/user.py`) — a registered account. `User.register(...)` hashes the
-  password by **double-dispatch** through the `PasswordHasher` port (the domain never imports
-  argon2). Equal by `UserId`.
-- **VOs:** `Email` (normalizes to lowercase, validates shape), `PasswordHash` (guaranteed to hold
-  only a hash, never plaintext), `UserId`.
-- **`RefreshToken`** (`domain/refresh_token/refresh_token.py`) — a persisted refresh credential
-  identified by `jti`. It stores **only the hash** of the secret. Behaviors: `issue`, `is_active`,
-  `revoke`, `rotate` (revoke current + mint successor; raises `InvalidRefreshToken` if not active —
-  this rejects replay of a revoked/expired token).
+**`Conversation`** (`domain/conversation/conversation.py`) — lifecycle `start` / `rename` / `delete`
+(soft) / `restore`, plus **two levels of authorization it enforces itself**:
 
-### Messaging
+- `ensure_owned_by(owner_id)` → `NotConversationOwner` — administration: rename, delete, restore, and
+  changing the membership.
+- `ensure_participant(participant_id)` → `NotConversationParticipant` — taking part: joining the live
+  channel, sending, reading history.
 
-- **`Conversation`** (`domain/conversation/conversation.py`) — lifecycle `start` / `rename` /
-  `delete` (soft) and `is_deleted`, plus **two levels of authorization it enforces itself**:
-  - `ensure_owned_by(owner_id)` (raises `NotConversationOwner`) — administration: rename, delete,
-    restore, and changing the membership.
-  - `ensure_participant(participant_id)` (raises `NotConversationParticipant`) — taking part:
-    joining the live channel, sending, reading history.
+Membership lives on the aggregate as `participant_ids: frozenset[ParticipantId]`, mutated by
+`add_participant` (idempotent; returns whether it was new) and `remove_participant` (raises
+`CannotRemoveConversationOwner` for the owner). `start` seeds the owner, so the owner is always a
+participant and can never be locked out. `delete` and `restore` are both **idempotent** — each is a
+no-op in the state it leads to, so neither can be corrupted by a retry.
 
-  Membership lives on the aggregate as `participant_ids: frozenset[ParticipantId]`, mutated by
-  `add_participant` (idempotent, returns whether it was new) and `remove_participant` (raises
-  `CannotRemoveConversationOwner` for the owner). `start` seeds the owner, so **the owner is always a
-  participant** and can never be locked out of their own conversation. `delete` (sets `deleted_at` +
-  `updated_at`) and `restore` (clears `deleted_at`, bumps `updated_at`) are both idempotent — each is
-  a no-op in the state it leads to, so neither can be corrupted by a retry.
-- **`Participant`** (`domain/conversation/participant.py`) — a read-side VO pairing a
-  `ParticipantId` with `joined_at`. The aggregate deliberately holds **ids only**: identity is all it
-  needs to decide access, and `joined_at` carries no invariant, so it is served from this projection
-  (`ConversationRepository.list_participants`) rather than loaded into the aggregate.
-- **`Message`** (`domain/message/message.py`) — an **immutable** persisted record and a **separate
-  aggregate** from `Conversation`. Its identity is `MessageId`, which is also the ordering key.
-- **VOs** (`domain/message/value_objects.py`):
-  - `MessageRole` — `StrEnum` with `USER`/`ASSISTANT` (wire values `"user"`/`"assistant"`).
-  - `MessageId` — the persisted **bigserial** sequence number (identity *and* order).
-  - `SenderId` — reference to the Identity user who sent it; **null for assistant** messages.
-  - `ClientMessageId` — client-generated idempotency key, unique per conversation.
-  - `MessageContent` — required non-empty (rejects blank/whitespace via `InvalidMessageContent`).
-  - `ConversationTitle` — trimmed, ≤ 200 chars.
+**`Participant`** is a read-side VO pairing a `ParticipantId` with `joined_at`. The aggregate
+deliberately holds **ids only**: identity is all it needs to decide access, and `joined_at` carries no
+invariant, so it is served from the `list_participants` projection rather than loaded into the
+aggregate.
 
-> **Why `OwnerId`/`ParticipantId` are not Identity's `UserId`.** `messaging` defines its own
-> (`domain/conversation/value_objects.py`) rather than importing `identity.UserId`. This keeps the
-> two bounded contexts **decoupled** — `messaging` doesn't depend on Identity's model; it just
-> stores the user's id as its own concept. The values happen to be the same UUID; the type boundary
-> is deliberate. `OwnerId` and `ParticipantId` are separate because they name different *roles* in
-> the aggregate, and the code reads better for it: `ensure_owned_by(OwnerId(...))` versus
-> `ensure_participant(ParticipantId(...))` says which rule is being applied.
->
-> The **one** place Messaging must ask Identity a question is admitting a participant by email. That
-> goes through the `UserDirectory` port (`application/ports.py`), implemented by
-> `IdentityUserDirectory` (`infrastructure/outbound/identity/`), which constructs Identity's `Email`
-> and returns a bare `UUID`. An anti-corruption layer, in infrastructure — where cross-context
-> coupling belongs — so the domain and use cases stay ignorant of Identity entirely.
+**`Message`** (`domain/message/message.py`) — an **immutable** record and a **separate aggregate** from
+`Conversation`. Its identity is `MessageId`, the persisted **bigserial** that is also the ordering key.
+`SenderId` is null for assistant messages; `ClientMessageId` is the client's idempotency key;
+`MessageContent` rejects blank content; `ConversationTitle` is trimmed and ≤ 200 chars.
+
+> **Why `OwnerId`/`ParticipantId` aren't Identity's `UserId`.** `messaging` defines its own rather than
+> importing `identity.UserId`, so the contexts stay decoupled — it stores the user's id as its own
+> concept. The values are the same UUID; the type boundary is deliberate. `OwnerId` and `ParticipantId`
+> are separate because they name different *roles*, and the call sites read better for it:
+> `ensure_owned_by(OwnerId(...))` versus `ensure_participant(ParticipantId(...))` says which rule
+> applies. The one question Messaging must ask Identity — resolving an invite email — goes through the
+> `UserDirectory` port and its `IdentityUserDirectory` adapter, in infrastructure, where cross-context
+> coupling belongs.
 
 ---
 
-## 7. Database schema
+## 4. Database schema
 
-Five Alembic migrations, a linear chain, all in `migrations/versions/`. Final schema:
+Five Alembic migrations in a linear chain (`migrations/versions/`). Final schema:
 
 ### `users` (0001)
 | Column | Type | Notes |
@@ -422,7 +186,7 @@ Five Alembic migrations, a linear chain, all in `migrations/versions/`. Final sc
 |---|---|---|
 | `jti` | String | PK |
 | `user_id` | UUID | FK → `users.id` **ON DELETE CASCADE**, indexed |
-| `token_hash` | String | SHA-256 of the secret (never the secret itself) |
+| `token_hash` | String | SHA-256 of the secret, never the secret itself |
 | `expires_at` | DateTime(tz) | |
 | `revoked_at` | DateTime(tz) | nullable — set on rotation/revocation |
 
@@ -442,12 +206,11 @@ Five Alembic migrations, a linear chain, all in `migrations/versions/`. Final sc
 | `user_id` | UUID | **composite PK**, indexed (`ix_conversation_participants_user_id`) |
 | `joined_at` | DateTime(tz) | |
 
-The composite PK on `(conversation_id, user_id)` *is* the uniqueness rule — a user cannot be admitted
-twice, enforced at the database as well as in the aggregate. The `user_id` index backs
-`list_for_participant` ("the conversations I'm in"). The ORM loads the set with
-`relationship(lazy="selectin")`, which is required rather than stylistic: the default lazy loader
-emits I/O on attribute access and raises under asyncio, and `selectin` batches, so listing N
-conversations costs one extra query rather than N.
+The composite PK *is* the uniqueness rule — a user cannot be admitted twice, enforced at the database
+as well as in the aggregate. The `user_id` index backs `list_for_participant` ("the conversations I'm
+in"). The ORM loads the set with `relationship(lazy="selectin")`, which is required rather than
+stylistic: the default lazy loader emits I/O on attribute access and raises under asyncio, and
+`selectin` batches, so listing N conversations costs one extra query rather than N.
 
 ### `messages` (0002, extended by 0003 & 0004)
 | Column | Type | Notes |
@@ -460,53 +223,43 @@ conversations costs one extra query rather than N.
 | `created_at` | DateTime(tz) | |
 | `client_message_id` | UUID | **nullable, added in 0004** — idempotency key |
 
-Indexes/constraints on `messages`:
-- `ix_messages_conversation_id_id` on `(conversation_id, id)` — backs **keyset pagination** and
-  ordered replay.
-- **`uq_messages_conversation_id_client_message_id`** unique on `(conversation_id, client_message_id)`
-  (0004) — the dedupe backstop. Postgres treats NULLs as distinct, so keyless sends and assistant
-  rows (both with `client_message_id = NULL`) never collide.
+- `ix_messages_conversation_id_id` on `(conversation_id, id)` — backs **keyset pagination** and ordered
+  replay.
+- **`uq_messages_conversation_id_client_message_id`** unique on
+  `(conversation_id, client_message_id)` — the dedupe backstop. Postgres treats NULLs as distinct, so
+  keyless sends and assistant rows never collide.
 
 ### Migration chain
 `0001_identity` → `0002_conversations` → `0003_message_role` → `0004_client_message_id` →
 `0005_conversation_participants`.
-- **0003** adds `role` with a temporary `server_default='user'` to backfill existing rows, then
-  drops the default so the app must supply role on every insert; also makes `sender_id` nullable.
-- **0004** adds `client_message_id` + the unique constraint. Building the backing unique index takes
-  an `ACCESS EXCLUSIVE` lock; it **cannot** use `CREATE UNIQUE INDEX CONCURRENTLY` because
-  migrations run inside a transaction (see the advisory lock below) and `CONCURRENTLY` isn't allowed
-  in a transaction. Acceptable on a small table; see [§15](#15-key-decisions--trade-offs) for the
-  large-table plan.
-- **0005** creates `conversation_participants` and **backfills the owner of every existing
-  conversation** as its first participant. The backfill is load-bearing, not cosmetic: access is now
-  decided by membership, so a conversation without a row would leave its own owner unable to connect,
-  post, or read history. It has no `WHERE` clause, so soft-deleted conversations are backfilled too
-  and remain restorable.
 
-### Migrations run on boot, serialized (`migrations/env.py`)
-Every replica runs `alembic upgrade head` during startup. Inside the migration transaction it first
-executes `SELECT pg_advisory_xact_lock(721103)` (key `721103`). This **serializes concurrent replica
-boots**: the first replica takes the lock and migrates; later starters block, then find the schema
-already at head and no-op. Postgres auto-releases the transaction-scoped lock on commit. The runner
-(`shared/infrastructure/outbound/migrations.py`) builds the Alembic `Config` **in code** (not from
-`alembic.ini`) specifically so `logging.fileConfig` doesn't reset the structured logger.
+- **0003** adds `role` with a temporary `server_default='user'` to backfill existing rows, then drops
+  the default so the app must supply it on every insert; also makes `sender_id` nullable.
+- **0004** adds `client_message_id` + the unique constraint. Building the backing index takes an
+  `ACCESS EXCLUSIVE` lock and **cannot** use `CREATE UNIQUE INDEX CONCURRENTLY`, because migrations
+  run inside a transaction and `CONCURRENTLY` isn't allowed in one. Acceptable on a small table.
+- **0005** creates `conversation_participants` and **backfills the owner of every existing
+  conversation** as its first participant. The backfill is load-bearing: access is now decided by
+  membership, so a conversation without a row would leave its own owner unable to connect, post, or
+  read history. It has no `WHERE` clause, so soft-deleted conversations are backfilled too and stay
+  restorable.
+
+**Migrations run on boot, serialized** (`migrations/env.py`). Every replica runs `alembic upgrade head`
+during startup; inside the migration transaction it first executes `SELECT pg_advisory_xact_lock(721103)`.
+The first replica takes the lock and migrates, later starters block and then find the schema already at
+head and no-op. Postgres auto-releases the transaction-scoped lock on commit. The runner
+(`shared/infrastructure/outbound/migrations.py`) builds the Alembic `Config` **in code** rather than
+from `alembic.ini`, specifically so `logging.fileConfig` doesn't reset the structured logger.
 
 ---
 
-## 8. How it works — end-to-end flows
+## 5. How a message flows
 
-### 8.0 The whole flow in one picture
+**In one sentence:** a client opens a WebSocket to *one* replica; that replica saves each message to
+Postgres, publishes it to a Redis channel named after the conversation, and *every* replica — the
+publisher included — reads it back off Redis and writes it to its own sockets.
 
-**The whole design in one sentence:** a client opens a WebSocket to *one* replica; that replica saves
-each message to Postgres, publishes it to a Redis channel named after the conversation, and *every*
-replica — the publisher included — reads it back off Redis and writes it to its own sockets.
-
-The six diagrams below walk through that step by step: the containers, what each replica builds at
-boot, what happens when a client connects, what a replica does with an inbound message, how that
-message reaches sockets on **both** replicas, and what teardown looks like. §8.1–8.6 cover the same
-ground in prose, and the step index at the end links every numbered step to the code.
-
-#### A. Topology — what talks to what
+### A. Topology
 
 ```
                           ┌──────────────────┐
@@ -522,20 +275,19 @@ ground in prose, and the step index at the end links every numbered step to the 
                                                          └────────────────┘
 ```
 
-Both API containers are the **same image with the same env** — only the published host port differs,
-and no load balancer sits in front (clients hit `:8000` / `:8001` directly, per `docker-compose.yml`).
-What matters for the rest of this section: a replica's **live sockets** and its **set of subscribed
-channels** are in-memory and private to that replica. It knows nothing about sockets on the other
-replica, and it doesn't need to — Redis is the only thing that closes that gap.
+Both API containers are the same image with the same env — only the published host port differs, and
+no load balancer sits in front. A replica's live sockets and its set of subscribed channels are
+in-memory and private to it: it knows nothing about sockets on the other replica, and doesn't need to.
+Redis is the only thing that closes that gap.
 
-#### B. Boot — what each replica builds (`app.py:44-83`)
+### B. Boot — what each replica builds (`app.py:44-83`)
 
 ```
   run_migrations() in asyncio.to_thread     ← Alembic is sync; advisory lock 721103 serializes replicas
         ▼
   engine (pool_pre_ping) + session_factory  → app.state
         ▼
-  create_redis_client()                     → app.state.redis
+  create_redis_client()                     → app.state.redis   (5s socket/connect timeouts, raw bytes)
         ▼
   ConnectionManager()                       → app.state.connection_manager   (local delivery half)
         ▼
@@ -546,10 +298,17 @@ replica, and it doesn't need to — Redis is the only thing that closes that gap
         ▼
   ConversationRegistry(mgr, subscriber)     → app.state.conversation_registry (the glue)
         ▼
+  RedisRateLimiter(redis, SystemClock(), …) → app.state.rate_limiter
+        ▼
   ══ yield: serve traffic ══
 ```
 
-#### C. A client connects
+`create_app()` configures logging, builds `FastAPI(lifespan=…)`, adds CORS (credentials enabled only
+when `*` is **not** in the origin list), registers both contexts' error handlers, and includes the
+health, identity, conversations, and WS routers. `main.py` runs uvicorn with `log_config=None` so it
+doesn't clobber the JSON logger.
+
+### C. A client connects
 
 ```
 CLIENT A        REPLICA 1         POSTGRES            REDIS
@@ -569,21 +328,27 @@ CLIENT A        REPLICA 1         POSTGRES            REDIS
   │                 │                 │                 │   ⑫ receive loop starts
 ```
 
-Two things to notice:
+- **② comes before ③** because a close *code* can't be sent on a connection that was never accepted.
+  A `uuid4` `connection_id` is set on a contextvar here and reset on exit, so every log line for this
+  socket carries the same correlation id.
+- **⑤ passes for any participant, not only the owner** — this one check is what makes a conversation
+  multi-user. It runs **once**, at connect; see [§ 10](#10-security-model) for what that means when a
+  membership is revoked.
+- **⑦ happens only for the *first* socket** on that conversation on this replica.
+  `ConnectionManager.register` reports the 0→1 transition and `ConversationRegistry` turns it into the
+  `SUBSCRIBE`; a second socket reuses the existing subscription. If the `SUBSCRIBE` fails, `join`
+  rolls back the local registration and the handler closes **1011** — a socket that isn't subscribed
+  would silently miss every message from the other replica, so the code **fails closed**.
+- **⑦ comes before ⑨ on purpose.** The socket is already receiving live messages before replay reads
+  the backlog, so nothing can be lost in between. The cost is ordering at the seam — see
+  [§ 8](#8-delivery-guarantees).
 
-- **⑦ happens only for the *first* socket** on that conversation on this replica. A second socket for
-  the same conversation reuses the subscription that already exists — `ConnectionManager.register`
-  reports the 0→1 transition, and `ConversationRegistry` turns that into the `SUBSCRIBE`. If the
-  `SUBSCRIBE` fails, the socket is closed `1011` rather than served: a socket that isn't subscribed
-  would silently miss every message sent from the other replica, so the code **fails closed**.
-- **⑦ comes before ⑨ on purpose.** The socket is already receiving live messages *before* replay reads
-  the backlog, so nothing can be lost in between. The cost is that a live message can arrive ahead of
-  an older replayed one — see [§10](#10-delivery-guarantees).
-
-#### D. One `message.send`, inside replica 1
+### D. One `message.send`, inside replica 1
 
 ```
   message.send frame arrives in the receive loop
+        ▼
+  ⓪ rate limit checked BEFORE parsing ───► over ─────► error frame, socket STAYS OPEN
         ▼
   ① frame + content validated ──────────► invalid ──► error frame, socket STAYS OPEN
         ▼
@@ -605,15 +370,23 @@ Two things to notice:
   ⑧ message.ack(user_msg) ──► CLIENT A
 ```
 
-**Persist before broadcast:** each COMMIT happens before its PUBLISH, so no client is ever shown a
-message that a failed transaction would have erased. Notice also what is *missing* here — the replica
-never writes the message to its own sockets at this point. Every delivery goes through Redis, which
-is diagram E.
+- **⓪ is before the JSON check on purpose**, so an unparseable flood costs quota too. A refused frame
+  is never parsed, persisted, broadcast, or shown to the assistant.
+- **`from_user` re-checks membership** (`post_message.py:57`) before anything else, so a revoked user
+  stops posting at once even on an already-open socket. It then does a pre-flight
+  `find_by_client_message_id`; a hit returns `(existing, False)` and `exchange` returns early — **no
+  new row, no re-broadcast, no second assistant reply**.
+- **Persist before broadcast:** each COMMIT happens before its PUBLISH, so no client is shown a
+  message a failed transaction would have erased.
+- Notice what's *missing*: the replica never writes to its own sockets here. Every delivery goes
+  through Redis — diagram E.
+- Any exception from `exchange` (DB or mock-AI) becomes `error("failed to handle message")` and the
+  loop continues. A failure never drops the socket.
 
-#### E. Fan-out — how the message reaches sockets on both replicas
+### E. Fan-out — reaching sockets on both replicas
 
-Alice and Bob are **two different users** who are both participants of this conversation, connected to
-different replicas. Alice sends; both of them receive.
+Alice and Bob are two different users, both participants, connected to different replicas. Alice
+sends; both receive.
 
 ```
 ALICE       REPLICA 1       REDIS       REPLICA 2        BOB
@@ -630,23 +403,22 @@ ALICE       REPLICA 1       REDIS       REPLICA 2        BOB
 
 - **This is the whole of multi-user broadcast.** `ConnectionManager` keys sockets by *conversation*,
   never by user, so ④ and ⑤ are the same code path whether the two sockets belong to one person on two
-  devices or to two different participants. Adding multiple users to a conversation therefore changed
-  only the **authorization** gate at ⑤ in diagram C — not one line of the delivery path here.
-- **The sender gets its own message back through Redis.** Replica 1 is not treated specially: it
-  receives its own `PUBLISH` on its own subscription (②) and delivers from there. That leaves exactly
-  **one** delivery path to any socket — `subscriber → ConnectionManager.broadcast` — instead of one
-  path for local sockets and a second for remote ones. It is also why the `SUBSCRIBE` back in diagram
-  C must complete before the socket is allowed to send anything.
-- **What happens between ② and ④:** the subscriber's reader task takes the message off Redis
-  (`get_message`), decodes the JSON back into a domain `Message`, and hands it to the local
-  `ConnectionManager`, which writes a `message.new` frame to every socket in that conversation.
-- **⑥ can arrive before ④.** The `message.new` frames are written by the subscriber task and the ack
-  by the receive-loop task — two independent tasks with no ordering between them. A client must not
-  assume the ack comes first.
-- **Replica 2 never reads Postgres here.** The entire message travels inside the Redis payload, so
-  fan-out costs one `PUBLISH` plus one decode per replica — no extra database queries.
+  devices or to two different participants. Adding multiple users changed only the **authorization**
+  gate at ⑤ in diagram C — not one line of the delivery path.
+- **The sender gets its own message back through Redis.** Replica 1 isn't special-cased: it receives
+  its own `PUBLISH` on its own subscription (②) and delivers from there. That leaves exactly one
+  delivery path to any socket — `subscriber → ConnectionManager.broadcast` — and no double-delivery.
+  It's also why the `SUBSCRIBE` in diagram C must complete before the receive loop starts.
+- **Between ② and ④:** the subscriber's reader task takes the message off Redis under a lock, decodes
+  the JSON back into a domain `Message`, and hands it to the local `ConnectionManager`, which writes a
+  `message.new` frame to every socket in that conversation.
+- **⑥ can arrive before ④.** The `message.new` frames are written by the subscriber task and the ack by
+  the receive-loop task — two independent tasks with no ordering between them. A client must not assume
+  the ack comes first.
+- **Replica 2 never reads Postgres here.** The whole message travels inside the Redis payload, so
+  fan-out costs one `PUBLISH` plus one decode per replica.
 
-#### F. Teardown
+### F. Teardown
 
 ```
   ── one socket goes away ──────────────────────────────────────────────────────
@@ -669,12 +441,14 @@ ALICE       REPLICA 1       REDIS       REPLICA 2        BOB
   redis.aclose() → engine.dispose()
 ```
 
-While the replica is running, the subscriber also **repairs itself**: if a read from Redis fails, it
-logs, waits 500 ms, rebuilds the pub/sub connection, and re-`SUBSCRIBE`s every channel it still needs.
-A brief Redis outage therefore doesn't cost the replica its subscriptions. Messages published *during*
-the outage are lost by pub/sub and recovered instead by the client's next `last_seen_seq` replay.
+While running, the subscriber also **repairs itself**: if a read from Redis fails it logs, waits
+500 ms, rebuilds the pub/sub connection, and re-`SUBSCRIBE`s every channel it still needs. A brief
+Redis outage therefore doesn't cost the replica its subscriptions. Messages published *during* the
+outage are lost by pub/sub and recovered instead by the client's next `last_seen_seq` replay. A socket
+whose send raises during a broadcast is dropped and unregistered (dead-socket cleanup) without
+affecting the rest of the conversation.
 
-#### Where each diagram lives in the code
+### Where each diagram lives in the code
 
 | Diagram | Files |
 |---|---|
@@ -684,230 +458,92 @@ the outage are lost by pub/sub and recovered instead by the client's next `last_
 | E — publish, fan-out, local delivery | `outbound/redis/` (all four files); `realtime/connection_manager.py:83-98` |
 | F — leave, unsubscribe, drain | `realtime/conversation_registry.py:55-59`; `app.py:72-83` |
 
-### 8.1 Boot / lifespan / composition root
+---
 
-Entry: `main.py:main` loads settings and calls `uvicorn.run("dizzchat.app:app", …, log_config=None)`
-(so uvicorn doesn't clobber the JSON logger). `app = create_app()` runs at import.
+## 6. REST endpoints
 
-`create_app()` (`app.py`), in order: configure logging → build `FastAPI(lifespan=lifespan)` → add
-CORS (credentials enabled only when `*` is **not** in the origin list) → register identity + messaging
-error handlers → include routers in order: `health_router`, `identity_router`, `conversations_router`,
-`ws_router`.
+Request sessions are request-scoped: `shared/.../api/dependencies.py:get_session` opens one per
+request, publishes it on `request.state`, and rolls back on error. It deliberately does **not**
+commit — a `yield` dependency's teardown runs on the request exit stack, which unwinds only after the
+response has been sent, so committing there would acknowledge a write before it was durable. The
+commit lives in `shared/.../api/transactional_route.py:TransactionalRoute`, which runs in the window
+between producing the response and sending it; routers opt in with `route_class=TransactionalRoute`,
+so use-cases just add to the session. Because the commit sits on the router, a session-taking route
+registered without it would discard its writes behind a `2xx` — `create_app` calls
+`assert_session_routes_are_transactional` and refuses to boot rather than fail silently. Domain errors
+map to status codes centrally, one handler per error type, so services never construct HTTP responses.
 
-`lifespan` on startup, in exact order:
-1. `await asyncio.to_thread(run_migrations)` — migrate **off the event loop**, advisory-lock
-   serialized.
-2. Build the async **engine** (`pool_pre_ping=True`) → `app.state.engine`.
-3. Build the **session factory** (`async_sessionmaker(expire_on_commit=False)`) → `app.state.session_factory`.
-4. Create the **Redis client** (5s socket/connect timeouts, raw bytes) → `app.state.redis`.
-5. Create `ConnectionManager()` → `app.state.connection_manager`.
-6. Create `RedisConversationSubscriber(redis, connection_manager)` and **`await subscriber.start()`**
-   (launches the background reader task). (Held as a local; reachable via the registry.)
-7. `RedisMessageBroadcaster(redis)` → `app.state.message_broadcaster`.
-8. `ConversationRegistry(connection_manager, subscriber)` → `app.state.conversation_registry`.
-9. `RedisRateLimiter(redis, SystemClock(), limit=…, window_seconds=…)` → `app.state.rate_limiter`
-   (same Redis client, a use unrelated to fan-out — see [§8.6](#86-rate-limiting)).
+### `/auth`
 
-On shutdown: drain sockets via `connection_manager.close_all()` bounded by
-`SHUTDOWN_DRAIN_TIMEOUT_SECONDS` (a timeout is logged and swallowed), then `subscriber.stop()`,
-`redis.aclose()`, `engine.dispose()`.
+- **`POST /signup` → 201** — `RegisterUser`: build `Email` (→ 422 on bad shape); duplicate check →
+  `EmailAlreadyRegistered` (**409**); hashing off-loaded via `asyncio.to_thread` (argon2 is CPU-bound);
+  `users.add`.
+- **`POST /login` → 200** — `AuthenticateUser`: a malformed email yields the same generic
+  `InvalidCredentials` as a wrong password (anti-enumeration); a **missing user still runs a dummy
+  hash**, so response time doesn't leak existence; on success mint an access JWT plus a freshly
+  persisted refresh token.
+- **`POST /refresh` → 200** — rotation + revocation. `parse_refresh` splits `"<jti>.<secret>"`;
+  `verify_refresh` compares `SHA-256(secret)` with `hmac.compare_digest`; `stored.rotate(...)` raises
+  if the token isn't active (rejecting replay), the revocation is persisted, and a **new pair** is
+  returned.
+- **`GET /me` → 200** — `get_current_user` uses `HTTPBearer(auto_error=False)`; missing creds → 401
+  with `WWW-Authenticate: Bearer`; a bad token → 401.
 
-**`app.state` singletons:** `engine`, `session_factory`, `redis`, `connection_manager`,
-`message_broadcaster`, `conversation_registry`, `rate_limiter`.
+### `/conversations`
 
-### 8.2 REST auth (`/auth`)
+All routes require a Bearer token. Reads and sends are open to any **participant**; rename, delete,
+restore, and membership changes are **owner-only**.
 
-Router: prefix `/auth`; `POST /signup` (201), `POST /login`, `POST /refresh`, `GET /me`. Request
-sessions are request-scoped: `shared/.../api/dependencies.py:get_session` commits on success and
-rolls back on error, so use-cases just add to the session and let teardown commit.
-
-- **`POST /auth/signup` → 201** — `RegisterUser.execute`: build `Email` (→ 422 on bad shape);
-  `get_by_email` duplicate check → `EmailAlreadyRegistered` (**409**); hashing off-loaded via
-  `asyncio.to_thread(User.register, …)` (argon2 is CPU-bound); `users.add(user)`. Returns
-  `{id, email, created_at}`.
-- **`POST /auth/login` → 200** — `AuthenticateUser.execute`: parse `Email` (malformed → generic
-  `InvalidCredentials`, anti-enumeration); `get_by_email`; if the user is missing it **still** runs
-  a dummy hash (`asyncio.to_thread`) so timing doesn't reveal existence, then `InvalidCredentials`
-  (**401**); verify off-loop; on success mint a **`TokenPair`**: an access JWT
-  (`issue_access(user.id)`) + a freshly generated + persisted refresh token. Returns
-  `{access_token, refresh_token, token_type: "bearer"}`.
-- **`POST /auth/refresh` → 200 (rotation + revocation)** — `RefreshAccessToken.execute`:
-  `parse_refresh` splits `"<jti>.<secret>"` (malformed → `InvalidRefreshToken`); `get_by_jti`;
-  `verify_refresh` compares `SHA-256(secret)` against the stored hash with `hmac.compare_digest`;
-  `stored.rotate(...)` (raises if not active → rejects replay), `refresh_tokens.save(stored)` (merge
-  to persist the revocation), `refresh_tokens.add(rotated)`. Returns a **new** pair.
-- **`GET /auth/me` → 200** — `get_current_user` uses `HTTPBearer(auto_error=False)`; missing creds →
-  401 with `WWW-Authenticate: Bearer`; `decode_access` → `InvalidAccessToken` → 401; returns
-  `{user_id}`.
-
-### 8.3 Conversations REST (`/conversations`)
-
-All routes require a Bearer token (reuses Identity's `get_current_user`). Reads and sends are open to
-any **participant**; rename, delete, restore, and membership changes are **owner-only**.
-
-- **Create → 201** — `Conversation.start(...)` (which seeds the owner as the first participant) then
-  `conversations.create(..., participant_ids=...)`, so the conversation row and its owner membership
-  land in one unit of work.
+- **Create → 201** — `Conversation.start(...)` seeds the owner as the first participant, then
+  `conversations.create(..., participant_ids=...)`, so the row and its owner membership land in one
+  unit of work.
 - **List** — `list_for_participant` joins `conversation_participants` on `user_id = ?` and filters
-  `deleted_at IS NULL`, newest first. Returns conversations the caller **owns or was invited to**.
-- **Rename** — `get` (→ 404 if absent), `ensure_owned_by` (→ 403), `rename`, `update`.
-- **Delete → 204 (soft)** — `get` (→ 404), `ensure_owned_by`, `delete(now)` sets `deleted_at`,
-  `update`. Because `get` already filters `deleted_at IS NULL`, deleting an already-deleted
-  conversation returns 404 (idempotent from the client's view).
-- **`POST /{id}/restore` → 200 `ConversationResponse`** — the inverse. `RestoreConversation.execute`
-  is the **only** caller of `get_including_deleted`, the one repository read without the
-  `deleted_at IS NULL` filter — every other read must keep a deleted conversation invisible, so the
-  exception is a separate, explicitly named method rather than a flag on `get`. Then
-  `ensure_owned_by` (→ 403), `restore(now)`, `update`. `404` only if the id never existed. Restoring
-  an **active** conversation returns 200 and changes nothing, including `updated_at`, so a retried
-  undo is safe — the alternative (`409` for "not deleted") would fail the retry. Delete never touched
-  the message or `conversation_participants` rows, so clearing `deleted_at` brings the full history
-  and membership back with no data repair.
-- **`GET /{id}/messages` — cursor pagination** — query `before` (int ≥ 1, optional) + `limit`
-  (default 50, 1–100). `GetConversationHistory.execute`: `get` (→ 404), `ensure_participant` (→ 403),
-  then **over-fetch by one** (`list_history(limit=limit+1)`), compute `has_more = fetched > limit`,
-  trim to `limit`, `next_cursor = items[-1].id if has_more else None`. Query is **keyset**:
-  `WHERE conversation_id = ? [AND id < before] ORDER BY id DESC LIMIT ?` — newest-first, backed by
-  `ix_messages_conversation_id_id`. Response: `{items, next_cursor, has_more}`; pass `next_cursor`
-  as the next `before`.
-
-**Participants** — the three routes that make a conversation multi-user:
-
-- **`POST /{id}/participants` → 204** — `AddParticipant.execute`: `get` (→ 404),
-  `ensure_owned_by` (→ **403**, only the owner invites), `users.find_id_by_email(email)` via the
-  `UserDirectory` port (`None` → `ParticipantUserNotFound`, **404**), then
-  `conversation.add_participant(...)` and — **only if the membership is new** —
-  `conversations.add_participant(..., joined_at=now)`. Re-inviting an existing participant is a
-  successful no-op, so a retrying client cannot create a duplicate. The composite PK is the backstop
-  if two invites race past the in-aggregate check.
-- **`GET /{id}/participants` → 200** — `ListParticipants.execute`: `get` (→ 404),
-  `ensure_participant` (→ 403), then `list_participants` → `[{user_id, joined_at}]`, oldest first.
-- **`DELETE /{id}/participants/{user_id}` → 204** — `RemoveParticipant.execute`: `get` (→ 404), then
-  one rule covering both kick and leave — permitted if the actor **is the owner** or is removing
-  **themselves**, else `NotConversationOwner` (403). `conversation.remove_participant` then refuses
-  the owner (`CannotRemoveConversationOwner`, **409**) and rejects someone who never joined
-  (`NotConversationParticipant`, 403), so a refusal is distinguishable from a no-op.
-
-### 8.4 WebSocket lifecycle (`/ws/conversations/{id}`) — the core
-
-Handler: `realtime/websocket.py:conversation_ws`. Close-code constants: `4401` auth, `4403`
-forbidden, `1011` internal; drain uses `1001`.
-
-1. `await websocket.accept()` — accept first (so we can send a close *code* on rejection). A `uuid4`
-   `connection_id` is then set on the `connection_id_var` contextvar (reset on exit), so every log
-   line emitted while serving this socket carries the same correlation id.
-2. **First-frame auth with timeout** — `asyncio.wait_for(receive_json(), WS_AUTH_TIMEOUT_SECONDS)`.
-   Timeout / non-JSON → **close 4401**. A plain disconnect before the frame → just return.
-3. **Token decode** — validate the `AuthFrame`, then `tokens.decode_access(token)`. Invalid frame or
-   bad/expired token → **close 4401**. The `auth` payload also carries an optional `last_seen_seq`.
-4. **Access check** — `access.ensure(conversation_id, participant_id)` in its own session
-   (`SessionScopedConversationAccess` → `EnsureConversationAccess` → `ensure_participant`).
-   `ConversationNotFound` / `NotConversationParticipant` → **close 4403**. Any participant passes, not
-   only the owner — this one check is what makes the conversation multi-user. It runs **once**, at
-   connect; see [§11](#11-security-model) for what that means when a membership is revoked.
-5. **`auth.ok`** — build a `Connection` (a lock-wrapped socket) and send `{"type":"auth.ok"}`.
-6. **Join + subscribe (fail-closed)** — `registry.join(conversation, connection)`: under a lock,
-   register the socket locally; if it's the **first** socket for this conversation on this replica,
-   `await subscriber.subscribe(conv:{id})` on Redis. If the subscribe fails it rolls back the local
-   registration and re-raises → the handler **closes 1011**. This is deliberate: a socket that
-   couldn't subscribe would silently miss cross-replica messages, so we fail closed.
-7. **`last_seen_seq` replay — after joining live delivery** — `_replay_missed`: if `last_seen_seq`
-   is `None`, do nothing (a fresh client loads history over REST). Otherwise
-   `replayer.replay_since(after=MessageId(last_seen_seq))` and send each missed message as a
-   `message.new` frame. Replay happens **after** the socket is already receiving live traffic, so no
-   message can slip through the gap — at the cost of ordering at the seam (see
-   [§10](#10-delivery-guarantees)).
-8. **Receive loop** — per inbound frame:
-   - **Rate limit, before parsing** — `limiter.allow(sender_id.value)`. Over the limit →
-     `error("rate limit exceeded")`, keep the socket open, and the frame is never parsed, persisted,
-     broadcast, or shown to the assistant. The check comes *before* the JSON check precisely so an
-     unparseable flood costs quota too; see [§8.6](#86-rate-limiting).
-   - non-JSON → send `error("invalid JSON")`, keep the socket open.
-   - not a valid `message.send` / blank content → `error("invalid message frame")`, keep open.
-   - **Re-validate the access token on every send** (`decode_access(token)` again). Expired → close
-     **4401**. A socket never outlives its token.
-   - `exchange.exchange(...)`. Any exception (DB or mock-AI) → log + `error("failed to handle
-     message")`, keep the socket open.
-   - On success → send `message.ack` (`{id, client_message_id, created_at}`).
-9. **`MessageExchange.exchange`** (`application/services/message_exchange.py`):
-   1. `writer.from_user(...)` → `(user_message, created)`. The session-scoped writer opens its own
-      session, runs `PostMessage.from_user`, and **commits** — **persist before broadcast**, so a
-      rollback can never surface an unstored message.
-   2. `PostMessage.from_user` re-checks **membership** (`ensure_participant`, so a revoked user stops
-      posting at once even on an open socket), then does a **pre-flight** `find_by_client_message_id`:
-      if the client id already exists, returns `(existing, False)` — **no new row**.
-   3. If `not created` → return early: **no re-broadcast, no second assistant reply** (idempotent).
-   4. Else `broadcaster.broadcast(conv, user_message)` → the mock `reply_to(content)` (`"You said:
-      …"`) → persist+commit the assistant message → `broadcast(conv, assistant_message)`.
-   5. Returns the **user** message (that's what the ack echoes).
-10. **Disconnect / cleanup** — `WebSocketDisconnect` is caught; other errors → close 1011;
-    `finally: registry.leave(...)` unregisters and, if it was the **last** local socket for the
-    conversation, unsubscribes from Redis. During a broadcast, any socket whose send raises is
-    dropped and unregistered (dead-socket cleanup).
-
-### 8.5 Redis fan-out
-
-- **Publish** — `RedisMessageBroadcaster.broadcast` does exactly one thing:
-  `redis.publish("conv:{id}", encode(message))`. It never touches sockets.
-- **Subscribe (one per replica)** — `RedisConversationSubscriber` runs a single background reader
-  task that reads under a lock, decodes each frame, and hands the domain `Message` to the **local**
-  `ConnectionManager.broadcast`, which serializes it as a `message.new` frame to that conversation's
-  local sockets. It dynamically (un)subscribes to `conv:{id}` channels on 0↔1 local-socket
-  transitions (driven by the registry) and reconnects-with-backoff + resubscribes on read failure.
-- **Single uniform delivery path.** The producing replica is **not** special-cased: it publishes to
-  Redis and receives its own message back through its own subscriber, just like every other replica.
-  So there's exactly one code path to a socket (`subscriber → ConnectionManager.broadcast`) and no
-  double-delivery. This is *why* `join` awaits the subscribe before the receive loop starts — even
-  the sender's own `message.new` echo depends on that subscription being live.
-
-### 8.6 Rate limiting
-
-`RedisRateLimiter` (`outbound/redis/redis_rate_limiter.py`) implements the `RateLimiter` port
-(`realtime/rate_limit.py`) — the *second*, independent use of Redis, unrelated to pub/sub.
-
-- **Algorithm** — fixed window. `window = int(clock.now().timestamp()) // window_seconds`, key
-  `ratelimit:ws:{user_id}:{window}`, then `INCR` + `EXPIRE` **in one transaction** (as two round
-  trips, a crash between them would leave a key with no TTL and lock that user out for good). Allowed
-  when the resulting count is `<= limit`.
-- **The window number is part of the key**, so each window has its own self-expiring key: no sweeper,
-  and re-applying the TTL can't slide the window forward and starve a busy client.
-- **Per user, shared across replicas.** Because the counter is in the Redis both replicas share, one
-  quota covers every socket that user holds on either instance. `tests/.../redis/test_redis_rate_limiter.py`
-  runs *two* limiter instances against one Redis to prove exactly that — a fake can't.
-- **Configuration** — `WS_RATE_LIMIT_MESSAGES` (default 20) per `WS_RATE_LIMIT_WINDOW_SECONDS`
-  (default 10). A limit of `0` disables the check and never touches Redis.
-- **Fails open** — any Redis error is logged at WARNING and the frame is allowed. A rate limit is a
-  protection, not an authorization rule. (Largely theoretical: `registry.join` already fails *closed*
-  with `1011` when Redis is down, so a socket can't reach the receive loop without Redis.)
-- **Wiring** — built once per replica in the lifespan (`app.state.rate_limiter`) and injected via
-  `provide_rate_limiter`, exactly like the broadcaster and the registry.
-
-Known flaw, accepted: a fixed window allows up to `2 * limit` frames back to back across a boundary.
-See [§15](#15-key-decisions--trade-offs).
+  `deleted_at IS NULL`, newest first: the conversations the caller **owns or was invited to**.
+- **Rename / Delete** — `get` (→ 404), `ensure_owned_by` (→ 403), then `rename` or `delete(now)`
+  (which sets `deleted_at`). Because `get` already filters deleted rows, deleting an
+  already-deleted conversation returns 404 — idempotent from the client's view.
+- **`POST /{id}/restore` → 200** — the inverse, and the **only** caller of `get_including_deleted`.
+  Then `ensure_owned_by` (→ 403), `restore(now)`. `404` only if the id never existed. Restoring an
+  **active** conversation returns 200 and changes nothing, including `updated_at`, so a retried undo is
+  safe — `409 "not deleted"` would fail the retry. Delete never touched the message or participant
+  rows, so clearing `deleted_at` brings the full history and membership back with no data repair.
+- **`GET /{id}/messages`** — cursor pagination. Query `before` (int ≥ 1, optional) + `limit` (default
+  50, 1–100). `get` (→ 404), `ensure_participant` (→ 403), then **over-fetch by one**, compute
+  `has_more = fetched > limit`, trim, and set `next_cursor = items[-1].id if has_more else None`. The
+  query is **keyset** — `WHERE conversation_id = ? [AND id < before] ORDER BY id DESC LIMIT ?` —
+  backed by `ix_messages_conversation_id_id`.
+- **`POST /{id}/participants` → 204** — `ensure_owned_by` (→ **403**, only the owner invites),
+  `users.find_id_by_email` via the `UserDirectory` port (`None` → `ParticipantUserNotFound`, **404**),
+  then `add_participant` and — **only if the membership is new** — the row insert. Re-inviting is a
+  successful no-op, so a retrying client cannot duplicate; the composite PK is the backstop if two
+  invites race past the in-aggregate check.
+- **`GET /{id}/participants` → 200** — `ensure_participant` (→ 403), then `[{user_id, joined_at}]`,
+  oldest first.
+- **`DELETE /{id}/participants/{user_id}` → 204** — one rule covers both kick and leave: permitted if
+  the actor **is the owner** or is removing **themselves**, else 403. `remove_participant` then refuses
+  the owner (**409**) and rejects someone who never joined (403), so a refusal is distinguishable from
+  a no-op.
 
 ---
 
-## 9. Real-time protocol reference
+## 7. WebSocket protocol
 
 **Endpoint:** `ws://<host>/ws/conversations/{conversation_id}`.
-**Envelope:** `{"type": ..., "payload": {...}}` for data; `{"type": "error", "error": "<detail>"}`
-for failures. Inbound frames are Pydantic-validated; the only two inbound types are `auth` and
+**Envelope:** `{"type": ..., "payload": {...}}` for data; `{"type": "error", "error": "<detail>"}` for
+failures. Inbound frames are Pydantic-validated; the only two inbound types are `auth` and
 `message.send` (`realtime/protocol.py`).
 
-### Inbound (client → server)
-
 ```jsonc
-// first frame — authenticate the connection
+// inbound — first frame, authenticate the connection
 { "type": "auth", "payload": { "token": "<access_token>", "last_seen_seq": null } }
 
-// send a message
+// inbound — send a message
 { "type": "message.send",
   "payload": { "content": "hello", "client_message_id": "<uuid or null>" } }
 ```
 
-### Outbound (server → client)
-
 ```jsonc
+// outbound
 { "type": "auth.ok" }
 
 { "type": "message.new",
@@ -928,241 +564,163 @@ for failures. Inbound frames are Pydantic-validated; the only two inbound types 
 
 | Code | Meaning |
 |---|---|
-| 4401 | auth failed — timeout, non-JSON, invalid frame, or bad/expired token (incl. on a later send) |
-| 4403 | not the conversation owner, or the conversation doesn't exist |
+| 4401 | auth failed — timeout, non-JSON, invalid frame, or a bad/expired token (including on a later send) |
+| 4403 | not a participant of the conversation, or it doesn't exist |
 | 1011 | internal — e.g. the Redis fan-out subscription couldn't be established (fail closed) |
 | 1001 | server shutting down (graceful socket drain) |
 
-Bad JSON or an invalid `message.send` returns an `error` frame and **keeps the socket open**; only
-auth/ownership failures close it.
+Bad JSON, an invalid `message.send`, or exceeding the rate limit returns an `error` frame and **keeps
+the socket open**; only auth and access failures close it.
 
 ---
 
-## 10. Delivery guarantees
+## 8. Delivery guarantees
 
-Two guarantees ship (the assignment's chosen bonus):
+Two guarantees ship — the assignment's one chosen bonus.
 
-### Idempotent send
-`client_message_id` is a client UUID acting as an idempotency key. Re-sending the same value returns
-the existing message's `id` in a `message.ack` — **no second row, no re-broadcast, no second
-assistant reply**. Enforced in two layers: a pre-flight `find_by_client_message_id` in
-`PostMessage.from_user`, and the DB unique constraint `uq_messages_conversation_id_client_message_id`
-as the race backstop. NULL client ids are distinct in Postgres, so keyless sends never collide.
+**Idempotent send.** `client_message_id` is a client UUID acting as an idempotency key. Re-sending the
+same value returns the existing message's `id` in a `message.ack` — no second row, no re-broadcast, no
+second assistant reply. Enforced in two layers: the pre-flight `find_by_client_message_id` in
+`PostMessage.from_user`, and the unique constraint
+`uq_messages_conversation_id_client_message_id` as the race backstop. NULL client ids are distinct in
+Postgres, so keyless sends never collide.
 
-### Reconnect replay (`last_seen_seq`)
-On (re)connect the client may include `last_seen_seq` in the `auth` payload:
-- `null` — no replay; load prior history via `GET /conversations/{id}/messages`.
-- `0` — full replay of the conversation.
-- `N` — replay messages with `seq > N`, oldest-first, as `message.new` frames.
+**Reconnect replay (`last_seen_seq`).** On (re)connect the client may include it in the `auth` payload:
+`null` — no replay, load history over REST; `0` — full replay; `N` — messages with `seq > N`,
+oldest-first, as `message.new` frames. `ReplayMessages` paginates `list_since` 500 at a time,
+ascending, so a long backlog streams in order.
 
-`ReplayMessages` paginates `list_since` (500 at a time, ascending) so a long backlog streams in
-order.
-
-### The seam trade-off (important)
-Replay begins **after** the socket has joined live delivery, so no message is missed — but the
-contract is **at-least-once and *not* ordered at the seam**: a live frame can arrive ahead of a
-lower-`seq` replay frame. Therefore the **client must**:
-- apply each `seq` **at most once** (track a *seen-set*, not a high-water mark), and
-- order by the `id` each frame carries.
-
-A stricter server-side exactly-once/ordered option (buffer live frames during replay, release in
-`seq` order) is deferred — see [§15](#15-key-decisions--trade-offs).
+**The seam trade-off.** Replay begins **after** the socket has joined live delivery, so no message is
+missed — but the contract is **at-least-once and *not* ordered at the seam**: a live frame can arrive
+ahead of a lower-`seq` replay frame. So the client must apply each `seq` **at most once** — a
+*seen-set*, not a high-water mark, which would drop the later lower-`seq` frames — and order by the
+`id` each frame carries. There is no server-side exactly-once buffering; see
+[NOTES.md](./NOTES.md#what-i-cut--an-honest-read).
 
 ---
 
-## 11. Security model
+## 9. Rate limiting
 
-- **First-message WebSocket auth.** The client connects, then must send an `auth` frame with the
-  JWT within `WS_AUTH_TIMEOUT_SECONDS`, or the server closes with `4401`. This keeps tokens out of
-  URLs/access logs (unlike a query param) and gives a clean rejection close code.
-- **Token re-validated on every send.** `decode_access` runs again per `message.send`; an expired
-  token closes the socket (`4401`) — a socket can't outlive its access token.
-- **Two-level authorization on a conversation.** Reading and sending require **membership**
-  (`ensure_participant`); rename, delete, restore, and changing the membership require **ownership**
-  (`ensure_owned_by`). The owner is seeded as a participant and cannot be removed, so ownership always
-  implies access. Membership is re-checked on **every** send (`PostMessage.from_user`), not only at
-  connect, so revoking it stops the user posting immediately.
+`RedisRateLimiter` (`outbound/redis/redis_rate_limiter.py`) implements the `RateLimiter` port
+(`realtime/rate_limit.py`) — the second, independent use of Redis, unrelated to pub/sub.
+
+- **Fixed window.** `window = int(clock.now().timestamp()) // window_seconds`, key
+  `ratelimit:ws:{user_id}:{window}`, then `INCR` + `EXPIRE` **in one transaction** — as two round
+  trips, a crash between them would leave a key with no TTL and lock that user out for good. Allowed
+  while the resulting count is `<= limit`.
+- **The window number is part of the key**, so each window has its own self-expiring key: no sweeper,
+  and re-applying the TTL can't slide the window forward and starve a busy client.
+- **Per user, shared across replicas.** The counter lives in the Redis both replicas share, so one
+  quota covers every socket that user holds on either instance.
+- `WS_RATE_LIMIT_MESSAGES` (default 20) per `WS_RATE_LIMIT_WINDOW_SECONDS` (default 10). A limit of `0`
+  disables the check and never touches Redis.
+- **Fails open** — any Redis error is logged at WARNING and the frame is allowed. Largely theoretical:
+  `registry.join` already fails *closed* with `1011` when Redis is down, so a socket can't reach the
+  receive loop without Redis.
+- **Accepted flaw:** a fixed window allows up to `2 × limit` frames back to back across a boundary.
+
+---
+
+## 10. Security model
+
+- **First-message WebSocket auth**, within `WS_AUTH_TIMEOUT_SECONDS` or close `4401`. Keeps tokens out
+  of URLs and access logs and gives a clean rejection close code.
+- **The token is re-validated on every send.** `decode_access` runs again per `message.send`; an
+  expired token closes the socket — a socket can't outlive its access token.
+- **Two-level authorization.** Reading and sending require **membership**; rename, delete, restore, and
+  membership changes require **ownership**. The owner is seeded as a participant and cannot be removed,
+  so ownership always implies access. Membership is re-checked on **every** send
+  (`PostMessage.from_user`), not only at connect.
 - **Known limitation — revocation doesn't close live sockets.** The connect-time check runs once, so a
-  removed participant keeps *receiving* broadcasts until their socket drops; their *sends* are already
-  refused, and a reconnect is closed `4403`. Closing sockets on removal needs a cross-replica
-  revocation event; deliberately not built (see `NOTES.md`).
-- **Invited users are resolved, never asserted.** An invite names an email, which must belong to a
+  removed participant keeps *receiving* broadcasts until their socket drops. Their *sends* are already
+  refused and a reconnect is closed `4403`.
+- **Invited users are resolved, never asserted.** An invite names an email that must belong to a
   registered user (`404` otherwise), so a mistyped identifier cannot become a phantom participant.
-- **Per-user rate limit on the socket.** Every inbound frame is counted in Redis against
-  `WS_RATE_LIMIT_MESSAGES` per window before it is parsed, so an authenticated client cannot spend the
-  server's DB/AI budget in a loop, and unparseable floods are capped too. It is keyed per **user**, so
-  extra sockets or the other replica grant no extra allowance. Two gaps to state plainly: it **fails
-  open** if Redis is unreachable (a protection, not an authorization rule), and the **REST endpoints
-  are not rate limited** — `/auth/login` in particular has no throttle, so nothing slows a
-  password-guessing loop. See [§8.6](#86-rate-limiting).
-- **Passwords:** argon2id (`Argon2PasswordHasher`), verified with the library's constant-time check;
-  failures are swallowed to a boolean. Hashing always runs via `asyncio.to_thread` (off the loop).
-- **Anti-enumeration + timing defense** on login: malformed emails and missing users both yield the
-  same generic `InvalidCredentials`, and a missing user still triggers a dummy hash so response time
-  doesn't leak existence.
-- **Refresh tokens are opaque** `"<jti>.<secret>"` strings; only `SHA-256(secret)` is stored, so a
-  DB read can't reconstruct a usable token. Refresh **rotates** (old revoked, new issued) and
-  **rejects replay** of a revoked/expired token.
-- **Password length cap** (`max_length=1024`, email `320`) bounds argon2 CPU cost against a
-  long-input DoS on the unauthenticated signup/login endpoints.
-- **CORS** credentials are enabled **only** for explicitly configured origins, never `*`.
-- **`JWT_SECRET_KEY` min length 32** — a weak key fails fast at settings construction.
-- **No secrets in the repo**: `.env` is gitignored; `.env.example` is the template; the compose
+- **Per-user rate limit on the socket**, counted before parsing, so an authenticated client cannot
+  spend the server's DB/AI budget in a loop and unparseable floods are capped too. It fails open if
+  Redis is unreachable, and it counts inbound socket frames only.
+- **Passwords:** argon2id, verified with the library's constant-time check, always hashed via
+  `asyncio.to_thread` (off the loop). `max_length=1024` on the password (and 320 on the email) bounds
+  argon2 CPU cost against a long-input DoS on the unauthenticated endpoints.
+- **Refresh tokens are opaque** `"<jti>.<secret>"` strings; only `SHA-256(secret)` is stored, so a DB
+  read can't reconstruct a usable token. Refresh rotates and rejects replay.
+- **CORS** credentials are enabled only for explicitly configured origins, never `*`.
+  **`JWT_SECRET_KEY` min length 32** — a weak key fails fast at settings construction.
+- **No secrets in the repo:** `.env` is gitignored, `.env.example` is the template, and the compose
   `JWT_SECRET_KEY` is a labeled dev-only placeholder.
 
 ---
 
-## 12. Concurrency & async correctness
+## 11. Concurrency & resilience
 
 - **Nothing CPU-bound or blocking runs on the event loop.** argon2 hashing and the Alembic migration
   run are dispatched with `asyncio.to_thread`.
-- **`Connection` serializes sends.** Each socket is wrapped in a `Connection` that guards `send` and
-  `close` with an `asyncio.Lock`, so a broadcast frame and an ack/error frame can't interleave on the
-  same socket.
-- **One transaction per message (session-scoped UoW).** A WebSocket outlives any single request, so
-  it can't reuse the request-scoped `get_session`. Instead the session-scoped outbound adapters
+- **`Connection` serializes sends.** Each socket is wrapped in a `Connection` guarding `send` and
+  `close` with an `asyncio.Lock`, so a broadcast frame and an ack or error frame can't interleave on
+  the same socket.
+- **One transaction per message (session-scoped UoW).** A WebSocket outlives any single request, so it
+  can't reuse the request-scoped `get_session`. The session-scoped outbound adapters
   (`SessionScopedMessageWriter`, `SessionScopedConversationAccess`, `SessionScopedMessageReplayer`)
-  each open a fresh session per operation, run the relevant use-case, and commit. The message writer
-  commits **per message**.
-- **Migrations are safe under concurrent boots** via the advisory lock ([§7](#7-database-schema)).
-- **Graceful shutdown** drains live sockets (close `1001`) within a bounded timeout, then stops the
-  subscriber and disposes Redis + the DB pool.
+  each open a fresh session per operation, run the use-case, and commit — the writer per message.
+- **A failed AI or DB call never crashes the socket or worker**; it becomes an `error` frame and the
+  receive loop continues.
+- **Fail closed on fan-out setup, self-heal afterwards.** A failed subscribe on join closes the socket
+  `1011`; a failed read reconnects with backoff and resubscribes.
+- **Graceful shutdown** drains live sockets (close `1001`) within a bounded timeout — a timeout is
+  logged and swallowed — then stops the subscriber and disposes Redis and the DB pool.
+- **Migrations are safe under concurrent boots** via the advisory lock ([§ 4](#4-database-schema)).
 
 ---
 
-## 13. Resilience & failure semantics
-
-- **A failed AI or DB call never crashes the socket or worker.** In the receive loop, exceptions
-  from `exchange.exchange` become an `error` frame and the loop continues.
-- **Persist before broadcast.** The user message is committed before it's broadcast, so a rollback
-  can't surface a message that isn't stored.
-- **Fail closed on fan-out setup.** If the Redis subscribe can't be established on join, the socket
-  is closed `1011` rather than left silently missing cross-replica messages.
-- **Dead-socket cleanup.** A socket whose send raises during a broadcast is dropped and unregistered;
-  the rest of the conversation is unaffected.
-- **Subscriber self-heals.** The per-replica reader reconnects with backoff and resubscribes to its
-  active channels after a read failure.
-- **Idempotent migrations.** Concurrent replicas serialize on the advisory lock; late starters find
-  the schema at head and no-op.
-
----
-
-## 14. Testing strategy
+## 12. Testing
 
 - **Layout mirrors the source.** `tests/` follows `contexts/{identity,messaging}` down through
-  `domain/`, `application/`, `infrastructure/{api,security,redis}`, plus root `tests/test_health.py`
-  and `tests/test_logging.py`.
+  `domain/`, `application/`, `infrastructure/{api,security,redis}`, plus root `test_health.py` and
+  `test_logging.py`.
 - **Scale.** 190 tests across 35 files. Heaviest: `test_conversation_routes.py` (24),
   `test_websocket_routes.py` (18), `test_conversation.py` (15).
 - **The multi-user proof.**
   `test_websocket_routes.py::test_a_message_from_one_user_is_broadcast_to_every_other_user_in_the_conversation`
   drives **two sockets authenticated as two different users** on one conversation and asserts both
-  receive the `message.new`, while only the sender receives the `message.ack`.
+  receive the `message.new` while only the sender receives the `message.ack`.
 - **Fakes over infrastructure.** Almost every test uses in-memory fakes (`tests/contexts/*/fakes.py`)
-  — fake repositories, hasher, token service, broadcaster, responder, `FixedClock`, etc. — so unit
-  tests need no DB or network.
-- **Two real-infra integration suites**, both on a real `redis:7-alpine` via **testcontainers**
-  (session-scoped `redis_url` fixture; `pytest.skip`s if Docker or testcontainers is unavailable):
+  — repositories, hasher, token service, broadcaster, responder, `FixedClock` — so unit tests need no
+  DB or network.
+- **Two real-infra suites** on a real `redis:7-alpine` via **testcontainers** (session-scoped
+  `redis_url` fixture; `pytest.skip`s when Docker or testcontainers is unavailable):
   - `test_redis_fanout_integration.py` stands up **two independent replicas** (each a
     `ConnectionManager` + `RedisConversationSubscriber` + `ConversationRegistry`) on one Redis and
     asserts (a) a message published from replica A reaches a socket on replica B **and** loops back to
-    A's own socket via the same subscribe path, and (b) a replica only receives conversations it
+    A's own socket through the same subscribe path, and (b) a replica only receives conversations it
     subscribed to.
   - `test_redis_rate_limiter.py` covers the counter against real Redis — allow-up-to-the-limit,
-    per-user isolation, window rollover (via an injected movable clock, so no sleeping), the key's
-    TTL, `limit=0` disabling the check, fail-open on an unreachable Redis, and **two limiter instances
-    sharing one quota**, which is the cross-replica claim a fake could not prove.
+    per-user isolation, window rollover (via an injected movable clock, so no sleeping), the key's TTL,
+    `limit=0` disabling the check, fail-open on an unreachable Redis, and **two limiter instances
+    sharing one quota**, the cross-replica claim a fake could not prove.
 - **WebSocket route tests** use Starlette's sync `TestClient.websocket_connect(...)` with
-  `dependency_overrides` on the `provide_*` deps (fake writer/responder/broadcaster/token service),
-  covering the happy path, all close codes, and the "error frame keeps the socket open" cases.
+  `dependency_overrides` on the `provide_*` deps, covering the happy path, all close codes, and the
+  "error frame keeps the socket open" cases.
 - **CI = pre-commit.** `.github/workflows/ci.yml` runs `uv sync --locked` then
-  `uv run pre-commit run --all-files`, which runs ruff / ruff-format / mypy / pytest — the identical
-  set that runs on every local commit.
+  `uv run pre-commit run --all-files` — ruff, ruff-format, mypy, pytest, the identical set that runs on
+  every local commit.
 
 ---
 
-## 15. Key decisions & trade-offs
+## 13. Glossary
 
-**Made:**
-- **Modular monolith, not microservices.** One deployable run as N replicas satisfies the "2+
-  replicas + Redis" requirement without distributed-systems overhead, while hexagonal boundaries
-  keep a future split-point clean.
-- **No domain events / CQRS / event sourcing.** The two contexts coordinate through direct use-case
-  calls and reads share the write model. The assignment needs no cross-context reactions or
-  history-rebuild, so an event backbone would be complexity without a paying use case. Revisit if a
-  real consumer appears (activity feed, audit log, async workflow).
-- **SQLAlchemy 2.0 async over SQLModel.** Mature async story and an explicit split between
-  persistence models and Pydantic API DTOs.
-- **First-message WS auth over a token query param.** Keeps tokens out of logs; the query-param
-  approach is only a documented fallback.
-- **One named exception to the soft-delete filter, not a flag on `get`.** Restore needs to read a
-  deleted row; every other use case must not. So the port grew `get_including_deleted` with exactly
-  one caller (`RestoreConversation`) — an exception you can find by grep, rather than a boolean any
-  future caller could flip. Restore is idempotent for the same reason `delete` is: an undo that
-  fails on retry is the wrong shape.
-- **Rate limiting on the transport, in Redis, failing open.** The counter guards the socket (checked
-  in `_receive_loop` before parsing, so unparseable floods count too) rather than sitting inside
-  `MessageExchange`, where malformed frames would never reach it. It's keyed per user in shared Redis
-  so extra sockets or the other replica grant no extra allowance, answers with an `error` frame rather
-  than a `4429` close (a burst shouldn't cost a legitimate client its connection), and allows the
-  frame if Redis is unreachable — a protection, not an authorization rule. Accepted flaw: a fixed
-  window permits `2 * limit` across a boundary; a sliding window buys precision this doesn't need.
-
-**Deferred (production-hardening follow-ups, from `NOTES.md`):**
-- **Server-side exactly-once at the replay/live seam** — buffer live frames during replay and
-  release them in `seq` order, for a true ordered exactly-once stream (more server state + back
-  pressure). Today the client dedupes.
-- **Bounded replay for large backlogs** — cap/paginate replay with a deadline and fall back to the
-  REST history endpoint past a threshold, so one reconnect can't monopolize a socket.
-- **`CREATE UNIQUE INDEX CONCURRENTLY`** for the dedupe constraint on a large live table — build it
-  out-of-band, then `ALTER TABLE … ADD CONSTRAINT … USING INDEX` (can't run `CONCURRENTLY` inside
-  the advisory-lock transaction).
-- **Reconnect backoff/jitter** — a client concern; the server mandates no reconnect policy.
-- **Expand/contract migrations** — prefer add-nullable → backfill → enforce → drop across releases
-  so old and new code coexist during a rolling deploy.
-
----
-
-## 16. Glossary & quick-answer index
-
-**Glossary**
-- **Bounded context** — an independent model + vocabulary with its own boundary (`identity`,
+- **Bounded context** — an independent model and vocabulary with its own boundary (`identity`,
   `messaging`).
-- **Aggregate** — a consistency boundary you load/save as a unit (`User`, `Conversation`,
+- **Aggregate** — a consistency boundary loaded and saved as a unit (`User`, `Conversation`,
   `Message`, `RefreshToken`).
-- **Value object (VO)** — an immutable, self-validating value equal by content (`Email`,
-  `MessageContent`, `MessageId`).
+- **Value object** — an immutable, self-validating value equal by content (`Email`, `MessageContent`,
+  `MessageId`).
 - **Port** — an interface the core declares (`UserRepository`, `MessageBroadcaster`, `TokenService`).
-- **Adapter** — a concrete implementation of a port (SQLAlchemy repo, Redis broadcaster, JWT
-  service).
+- **Adapter** — a concrete implementation of a port (SQLAlchemy repo, Redis broadcaster, JWT service).
 - **Composition root** — where adapters are wired into use-cases (`app.py` lifespan +
   `api/dependencies.py`).
 - **Keyset pagination** — paging by a cursor on an indexed column (`id < before`), not `OFFSET`.
 - **At-least-once** — a message may be delivered more than once; the receiver must dedupe.
 - **Idempotency key** — `client_message_id`; a repeat send with the same key is a no-op ack.
 - **seq** — the message's monotonic bigserial `id`; both its identity and its order.
-- **Correlation id (`connection_id`)** — a `uuid4` set per WebSocket connection on the
-  `connection_id_var` contextvar and auto-attached to every JSON log record by `JsonFormatter`, so
-  all log lines for one socket share an id.
-
-**Where do I look to answer…**
-- *How does auth work?* → [§8.2](#82-rest-auth-auth), [§11](#11-security-model);
-  `contexts/identity/…`.
-- *How do several users end up in one conversation?* → [§8.3](#83-conversations-rest-conversations)
-  for the participant routes, [§6](#6-domain-model) for the aggregate rules,
-  [§11](#11-security-model) for who may do what.
-- *Show me the whole flow in one picture.* → [§8.0](#80-the-whole-flow-in-one-picture) (six diagrams,
-  boot → connect → send → fan-out → teardown, each step cited to code).
-- *How does a message travel end to end?* → [§8.0](#80-the-whole-flow-in-one-picture) for the diagrams,
-  then [§8.4](#84-websocket-lifecycle-wsconversationsid--the-core)–[§8.5](#85-redis-fan-out) for the prose.
-- *How do delete and restore work?* → [§8.3](#83-conversations-rest-conversations) for both routes,
-  [§6](#6-domain-model) for the idempotency rule, [§7](#7-database-schema) for `deleted_at`.
-- *What's the wire format?* → [§9](#9-real-time-protocol-reference); `realtime/protocol.py`.
-- *How is flooding prevented?* → [§8.6](#86-rate-limiting) for the algorithm and its wiring,
-  [§11](#11-security-model) for what it does and doesn't cover.
-- *What are the delivery guarantees?* → [§10](#10-delivery-guarantees).
-- *What's in the database?* → [§7](#7-database-schema); `migrations/versions/`.
-- *Where does X live in the code?* → [§5](#5-codebase-map).
-- *Why was X built this way / what's deferred?* → [§15](#15-key-decisions--trade-offs); `NOTES.md`.
-- *How do I trace one connection's logs?* → [§8.4](#84-websocket-lifecycle-wsconversationsid--the-core); `logging.py` (`connection_id`).
-- *How do I run/test it?* → [§3](#3-run--verify).
+- **Correlation id (`connection_id`)** — a `uuid4` set per WebSocket connection on a contextvar and
+  auto-attached to every JSON log record, so all log lines for one socket share an id.
