@@ -24,6 +24,7 @@ from dizzchat.contexts.messaging.application.services import (
     ListParticipants,
     RemoveParticipant,
     RenameConversation,
+    RestoreConversation,
 )
 from dizzchat.contexts.messaging.domain.conversation import (
     ConversationId,
@@ -41,6 +42,7 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.dependencies import 
     provide_list_participants,
     provide_remove_participant,
     provide_rename_conversation,
+    provide_restore_conversation,
 )
 from tests.contexts.messaging.fakes import (
     FakeConversationRepository,
@@ -76,6 +78,9 @@ def _build_app(
         conversations, clock
     )
     app.dependency_overrides[provide_delete_conversation] = lambda: DeleteConversation(
+        conversations, clock
+    )
+    app.dependency_overrides[provide_restore_conversation] = lambda: RestoreConversation(
         conversations, clock
     )
     app.dependency_overrides[provide_get_conversation_history] = lambda: GetConversationHistory(
@@ -172,6 +177,71 @@ async def test_delete_soft_deletes_and_hides_the_conversation(ctx: _Context) -> 
 
     listed = await ctx.client.get("/conversations")
     assert listed.json() == []
+
+
+async def test_restore_brings_a_deleted_conversation_back(ctx: _Context) -> None:
+    created = await ctx.client.post("/conversations", json={"title": "x"})
+    conversation_id = created.json()["id"]
+    await ctx.client.delete(f"/conversations/{conversation_id}")
+
+    restored = await ctx.client.post(f"/conversations/{conversation_id}/restore")
+
+    assert restored.status_code == 200
+    assert restored.json()["id"] == conversation_id
+    listed = await ctx.client.get("/conversations")
+    assert [c["id"] for c in listed.json()] == [conversation_id]
+
+
+async def test_restore_is_idempotent_and_accepts_an_active_conversation(ctx: _Context) -> None:
+    created = await ctx.client.post("/conversations", json={"title": "x"})
+    conversation_id = created.json()["id"]
+    await ctx.client.delete(f"/conversations/{conversation_id}")
+
+    first = await ctx.client.post(f"/conversations/{conversation_id}/restore")
+    second = await ctx.client.post(f"/conversations/{conversation_id}/restore")
+
+    assert (first.status_code, second.status_code) == (200, 200)
+    assert first.json() == second.json()
+
+
+async def test_restoring_a_conversation_owned_by_another_is_forbidden(ctx: _Context) -> None:
+    conversation_id = await _seed_conversation(ctx.conversations, owner_id=uuid4())
+    await ctx.conversations.update(
+        conversation_id=conversation_id,
+        title=ConversationTitle("seeded"),
+        updated_at=_NOW,
+        deleted_at=_NOW,
+    )
+
+    response = await ctx.client.post(f"/conversations/{conversation_id}/restore")
+
+    assert response.status_code == 403
+
+
+async def test_restoring_a_conversation_that_never_existed_is_not_found(ctx: _Context) -> None:
+    response = await ctx.client.post(f"/conversations/{uuid4()}/restore")
+
+    assert response.status_code == 404
+
+
+async def test_a_restored_conversation_serves_its_history_again(ctx: _Context) -> None:
+    created = await ctx.client.post("/conversations", json={"title": "x"})
+    conversation_id = created.json()["id"]
+    await ctx.messages.create(
+        conversation_id=ConversationId(UUID(conversation_id)),
+        sender_id=SenderId(ctx.caller_id),
+        role=MessageRole.USER,
+        content=MessageContent("kept through the delete"),
+        created_at=_NOW,
+    )
+    await ctx.client.delete(f"/conversations/{conversation_id}")
+    assert (await ctx.client.get(f"/conversations/{conversation_id}/messages")).status_code == 404
+
+    await ctx.client.post(f"/conversations/{conversation_id}/restore")
+
+    history = await ctx.client.get(f"/conversations/{conversation_id}/messages")
+    assert history.status_code == 200
+    assert [m["content"] for m in history.json()["items"]] == ["kept through the delete"]
 
 
 async def test_rename_a_conversation_owned_by_another_is_forbidden(ctx: _Context) -> None:

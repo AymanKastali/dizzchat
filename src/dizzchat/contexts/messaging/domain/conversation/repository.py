@@ -3,7 +3,8 @@
 Declared in the domain (the aggregate owns the contract for its own persistence); the concrete
 adapter lives in ``infrastructure/outbound/persistence``. Write methods take attributes rather
 than the aggregate, so the persistence layer cannot mutate domain state. Soft-deleted
-conversations are treated as absent — ``get`` and ``list_for_owner`` never return them.
+conversations are treated as absent — ``get`` and ``list_for_participant`` never return them. The
+single deliberate exception is ``get_including_deleted``, which restore needs to find its target.
 """
 
 from __future__ import annotations
@@ -54,6 +55,14 @@ class ConversationRepository(Protocol):
 
     async def get(self, conversation_id: ConversationId) -> Conversation | None:
         """Return the active conversation with this id (participants included), or ``None``."""
+        ...
+
+    async def get_including_deleted(self, conversation_id: ConversationId) -> Conversation | None:
+        """Return the conversation with this id even when soft-deleted, or ``None``.
+
+        The one read that sees past the soft-delete filter, so ``restore`` can find its target.
+        Every other read uses ``get`` — a deleted conversation must stay invisible to them.
+        """
         ...
 
     async def list_for_participant(self, participant_id: ParticipantId) -> list[Conversation]:

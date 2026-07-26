@@ -80,6 +80,13 @@ class SqlAlchemyConversationRepository:
         model = result.scalar_one_or_none()
         return _to_domain(model) if model is not None else None
 
+    async def get_including_deleted(self, conversation_id: ConversationId) -> Conversation | None:
+        result = await self._session.execute(
+            select(ConversationModel).where(ConversationModel.id == conversation_id.value)
+        )
+        model = result.scalar_one_or_none()
+        return _to_domain(model) if model is not None else None
+
     async def list_for_participant(self, participant_id: ParticipantId) -> list[Conversation]:
         result = await self._session.execute(
             select(ConversationModel)

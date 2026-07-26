@@ -165,6 +165,7 @@ in**.
 | `GET    /conversations`                | —                        | `200` `[ConversationResponse]`                               |
 | `PATCH  /conversations/{id}`           | `{title}`                | `200` `ConversationResponse`                                 |
 | `DELETE /conversations/{id}`           | —                        | `204` (soft-delete)                                          |
+| `POST   /conversations/{id}/restore`   | —                        | `200` `ConversationResponse` (undo the soft-delete)          |
 | `GET    /conversations/{id}/messages`  | — (query params below)   | `200` `MessagePageResponse`                                  |
 
 `GET /conversations/{id}/messages` is cursor-paginated, newest-first:
@@ -182,6 +183,19 @@ MessageResponse      { id, conversation_id, sender_id, role, content, created_at
 
 `MessageResponse.id` is the message's monotonic sequence number (`seq`). `sender_id` is `null` for
 assistant messages.
+
+#### Soft-delete and restore
+
+`DELETE` sets `deleted_at` rather than removing rows; every read filters deleted conversations out,
+so a deleted conversation returns `404` from history and disappears from `GET /conversations`. Its
+messages and participants are untouched, so `POST /conversations/{id}/restore` brings all of it
+back:
+
+- **Owner only.** A participant who isn't the owner gets `403`, as with rename and delete.
+- **Idempotent.** Restoring an already-active conversation returns `200` and changes nothing (not
+  even `updated_at`), so a retried request is harmless.
+- `404` only if the conversation never existed — being soft-deleted is precisely what makes it
+  restorable.
 
 ### Participants — many users in one conversation
 
@@ -418,6 +432,20 @@ conversation from the steps above.
 The message crossed users *and* replicas: persisted by `:8000`, published to Redis, delivered to a
 socket held by `:8001`.
 
+### 6. Soft-delete, then restore
+
+Still as **alice**, on the conversation from the steps above:
+
+1. `DELETE http://localhost:8000/conversations/<id>` → `204`.
+2. `GET http://localhost:8000/conversations` → the conversation is gone;
+   `GET /conversations/<id>/messages` → `404`.
+3. `POST http://localhost:8000/conversations/<id>/restore` → `200` with the conversation.
+4. `GET /conversations` lists it again, and `GET /conversations/<id>/messages` returns **every
+   message from before the delete** — soft-delete never removed them.
+
+Repeat step 3 and you still get `200`: restore is idempotent. As **bob** (a participant, not the
+owner) it returns `403`.
+
 Two negative checks worth showing: a third user who was never invited gets `403` from
 `GET /conversations/<id>/messages` and is closed with `4403` on connect; and bob, a participant but
 not the owner, gets `403` from `PATCH /conversations/<id>`.
@@ -432,9 +460,10 @@ Everything in the assignment's four "must build" sections is implemented. The it
 conscious scope decisions — optional *nice-to-haves*, the untaken bonuses, or documented nuances of
 features that already meet spec — not defects. Each production follow-up is recorded in `NOTES.md`.
 
-- **No conversation restore.** Delete is a soft-delete (`deleted_at`); there is no restore endpoint,
-  and reads filter deleted rows out. (Soft-delete and cursor pagination — the two Req-2
-  nice-to-haves — *are* built.)
+- **Restore has no time limit and no audit trail.** Both Req-2 nice-to-haves are built —
+  soft-delete + restore, and cursor pagination — but a conversation stays restorable forever, and
+  nothing records who deleted or restored it. A retention window (purge after N days) and an audit
+  log are the production follow-ups.
 - **Reconnect replay is at-least-once and unordered at the live/replay seam.** This is the bonus as
   specified ("at-least-once redelivery on reconnect"). Because the socket joins live delivery before
   replay runs (so nothing is missed), a live frame can arrive ahead of a lower-`seq` replay frame.

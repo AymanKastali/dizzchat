@@ -17,6 +17,7 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.controllers import (
     list_participants,
     remove_participant,
     rename_conversation,
+    restore_conversation,
 )
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -29,6 +30,7 @@ router.add_api_route(
     methods=["DELETE"],
     status_code=status.HTTP_204_NO_CONTENT,
 )
+router.add_api_route("/{conversation_id}/restore", restore_conversation, methods=["POST"])
 router.add_api_route("/{conversation_id}/messages", get_conversation_history, methods=["GET"])
 router.add_api_route(
     "/{conversation_id}/participants",

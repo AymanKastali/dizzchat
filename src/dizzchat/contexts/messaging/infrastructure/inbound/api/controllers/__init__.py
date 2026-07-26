@@ -10,6 +10,7 @@ from .list_conversations import list_conversations
 from .list_participants import list_participants
 from .remove_participant import remove_participant
 from .rename_conversation import rename_conversation
+from .restore_conversation import restore_conversation
 
 __all__ = [
     "add_participant",
@@ -20,4 +21,5 @@ __all__ = [
     "list_participants",
     "remove_participant",
     "rename_conversation",
+    "restore_conversation",
 ]

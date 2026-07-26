@@ -22,8 +22,9 @@ from dizzchat.contexts.messaging.domain.conversation.value_objects import (
 class Conversation:
     """A conversation between its participants, identified by ``id``.
 
-    Owns its lifecycle — started by an owner (:meth:`start`), retitled (:meth:`rename`), and
-    soft-deleted (:meth:`delete`) — and its membership: who may read and post
+    Owns its lifecycle — started by an owner (:meth:`start`), retitled (:meth:`rename`),
+    soft-deleted (:meth:`delete`) and restored (:meth:`restore`) — and its membership: who may
+    read and post
     (:meth:`ensure_participant`) versus who may administer it (:meth:`ensure_owned_by`). The owner
     is a participant from the moment the conversation starts, and cannot be removed.
 
@@ -67,6 +68,16 @@ class Conversation:
         """Soft-delete. Idempotent — re-deleting keeps the original timestamp."""
         if self.deleted_at is None:
             self.deleted_at = now
+            self.updated_at = now
+
+    def restore(self, now: datetime) -> None:
+        """Undo a soft-delete. Idempotent — restoring an active conversation changes nothing.
+
+        Deliberately symmetric with :meth:`delete`: both are no-ops in the state they lead to, so a
+        retried request cannot corrupt ``updated_at``.
+        """
+        if self.deleted_at is not None:
+            self.deleted_at = None
             self.updated_at = now
 
     def ensure_owned_by(self, owner_id: OwnerId) -> None:
