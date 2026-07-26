@@ -5,11 +5,16 @@
 > shipped**, not an earlier plan. Read this end to end and you should be able to answer essentially
 > any question about the app.
 >
-> **How it relates to the other docs.** `README.md` tells you how to *run* it; `NOTES.md` records
-> the deliberate scope cuts and self-critique. A separate pre-build design plan (kept out of the
-> shipped repo) is reconciled against the as-built system in [§16](#16-as-built-vs-the-old-design-plan).
-> **This guide is the source of truth for how the system behaves today.** Where a detail matters, it
-> cites the real file as `path:line` so you can jump straight to the code.
+> **Where to start.** Read [§8.0](#80-the-whole-flow-in-one-picture) first — six diagrams that trace
+> one message end to end. That gives you the shape of the system in a couple of minutes; everything
+> else here fills it in. [§16](#16-glossary--quick-answer-index) is a "where do I look to answer X"
+> index if you'd rather jump straight to a topic.
+>
+> **The four docs.** [`README.md`](./README.md) — how to run it, plus the REST + WebSocket API
+> reference. [`ARCHITECTURE.md`](./ARCHITECTURE.md) — the decisions and what was ruled out (the *why*).
+> **This guide** — how the system actually behaves (the *how*), and the source of truth where the docs
+> disagree. [`NOTES.md`](./NOTES.md) — deliberate scope cuts and self-critique. Where a detail matters
+> here, it cites the real file as `path:line` so you can jump straight to the code.
 
 ## Contents
 
@@ -28,8 +33,7 @@
 13. [Resilience & failure semantics](#13-resilience--failure-semantics)
 14. [Testing strategy](#14-testing-strategy)
 15. [Key decisions & trade-offs](#15-key-decisions--trade-offs)
-16. [As-built vs. the old design plan](#16-as-built-vs-the-old-design-plan)
-17. [Glossary & quick-answer index](#17-glossary--quick-answer-index)
+16. [Glossary & quick-answer index](#16-glossary--quick-answer-index)
 
 ---
 
@@ -430,6 +434,188 @@ already at head and no-op. Postgres auto-releases the transaction-scoped lock on
 
 ## 8. How it works — end-to-end flows
 
+### 8.0 The whole flow in one picture
+
+**The whole design in one sentence:** a client opens a WebSocket to *one* replica; that replica saves
+each message to Postgres, publishes it to a Redis channel named after the conversation, and *every*
+replica — the publisher included — reads it back off Redis and writes it to its own sockets.
+
+The six diagrams below walk through that step by step: the containers, what each replica builds at
+boot, what happens when a client connects, what a replica does with an inbound message, how that
+message reaches sockets on **both** replicas, and what teardown looks like. §8.1–8.5 cover the same
+ground in prose, and the step index at the end links every numbered step to the code.
+
+#### A. Topology — what talks to what
+
+```
+                          ┌──────────────────┐
+   client sockets ───────►│   api    :8000   │───┐
+                          │   (replica 1)    │   │       ┌────────────────┐
+                          └──────────────────┘   ├──────►│    postgres    │  users · conversations
+                                                 │       │   16-alpine    │  messages (id = seq)
+                          ┌──────────────────┐   │       └────────────────┘
+   client sockets ───────►│   api2   :8001   │───┤
+                          │   (replica 2)    │   │       ┌────────────────┐
+                          └──────────────────┘   └──────►│     redis      │  PUBLISH / SUBSCRIBE
+                                                         │    7-alpine    │  conv:{conversation_id}
+                                                         └────────────────┘
+```
+
+Both API containers are the **same image with the same env** — only the published host port differs,
+and no load balancer sits in front (clients hit `:8000` / `:8001` directly, per `docker-compose.yml`).
+What matters for the rest of this section: a replica's **live sockets** and its **set of subscribed
+channels** are in-memory and private to that replica. It knows nothing about sockets on the other
+replica, and it doesn't need to — Redis is the only thing that closes that gap.
+
+#### B. Boot — what each replica builds (`app.py:44-83`)
+
+```
+  run_migrations() in asyncio.to_thread     ← Alembic is sync; advisory lock 721103 serializes replicas
+        ▼
+  engine (pool_pre_ping) + session_factory  → app.state
+        ▼
+  create_redis_client()                     → app.state.redis
+        ▼
+  ConnectionManager()                       → app.state.connection_manager   (local delivery half)
+        ▼
+  RedisConversationSubscriber(redis, mgr)
+        .start()                            → reader task starts, idling (no channels subscribed yet)
+        ▼
+  RedisMessageBroadcaster(redis)            → app.state.message_broadcaster  (PUBLISH only)
+        ▼
+  ConversationRegistry(mgr, subscriber)     → app.state.conversation_registry (the glue)
+        ▼
+  ══ yield: serve traffic ══
+```
+
+#### C. A client connects
+
+```
+CLIENT A        REPLICA 1         POSTGRES            REDIS
+(browser)      (api :8000)        (shared)          (pub/sub)
+  │                 │                 │                 │
+  ├────────────────►│                 │                 │   ① GET /ws/… + Upgrade
+  │◄────────────────┤                 │                 │   ② accept() → 101 Switching
+  ├────────────────►│                 │                 │   ③ auth frame (≤ 5s, else 4401)
+  │                 ├────────────────►│                 │   ④ access.ensure() — own session
+  │                 │◄────────────────┤                 │   ⑤ owner confirmed (else 4403)
+  │◄────────────────┤                 │                 │   ⑥ auth.ok
+  │                 ├─────────────────┼────────────────►│   ⑦ SUBSCRIBE conv:{id}
+  │                 │◄────────────────┼─────────────────┤   ⑧ subscribed → join() returns
+  │                 ├────────────────►│                 │   ⑨ replay_since(last_seen_seq)
+  │                 │◄────────────────┤                 │   ⑩ missed rows, oldest-first
+  │◄────────────────┤                 │                 │   ⑪ message.new × N (replay)
+  │                 │                 │                 │   ⑫ receive loop starts
+```
+
+Two things to notice:
+
+- **⑦ happens only for the *first* socket** on that conversation on this replica. A second socket for
+  the same conversation reuses the subscription that already exists — `ConnectionManager.register`
+  reports the 0→1 transition, and `ConversationRegistry` turns that into the `SUBSCRIBE`. If the
+  `SUBSCRIBE` fails, the socket is closed `1011` rather than served: a socket that isn't subscribed
+  would silently miss every message sent from the other replica, so the code **fails closed**.
+- **⑦ comes before ⑨ on purpose.** The socket is already receiving live messages *before* replay reads
+  the backlog, so nothing can be lost in between. The cost is that a live message can arrive ahead of
+  an older replayed one — see [§10](#10-delivery-guarantees).
+
+#### D. One `message.send`, inside replica 1
+
+```
+  message.send frame arrives in the receive loop
+        ▼
+  ① frame + content validated ──────────► invalid ──► error frame, socket STAYS OPEN
+        ▼
+  ② decode_access(token) re-checked ────► expired ──► close 4401
+        ▼
+  ③ MessageExchange.exchange()
+        │
+        ├─► writer.from_user()  ─ own session ─► postgres: INSERT(role=user) + COMMIT
+        │        └─ duplicate client_message_id? ─► return the existing row, skip ④–⑦
+        │
+        ├─► ④ broadcast(user_msg) ────────────► redis: PUBLISH conv:{id}
+        │
+        ├─► ⑤ responder.reply_to() → "You said: …"     (mock assistant; no external LLM)
+        │
+        ├─► ⑥ writer.from_assistant() ─ own session ─► postgres: INSERT(role=assistant) + COMMIT
+        │
+        └─► ⑦ broadcast(assistant_msg) ───────► redis: PUBLISH conv:{id}
+        ▼
+  ⑧ message.ack(user_msg) ──► CLIENT A
+```
+
+**Persist before broadcast:** each COMMIT happens before its PUBLISH, so no client is ever shown a
+message that a failed transaction would have erased. Notice also what is *missing* here — the replica
+never writes the message to its own sockets at this point. Every delivery goes through Redis, which
+is diagram E.
+
+#### E. Fan-out — how the message reaches sockets on both replicas
+
+```
+CLIENT A    REPLICA 1       REDIS       REPLICA 2     CLIENT B
+(socket)   (api :8000)     pub/sub    (api2 :8001)    (socket)
+  │             │             │             │             │
+  │             ├────────────►│             │             │   ① PUBLISH conv:{id}
+  │             │◄────────────┤             │             │   ② loopback to replica 1
+  │             │             ├────────────►│             │   ③ fan-out to replica 2
+  │◄────────────┤             │             │             │   ④ message.new → A
+  │             │             │             ├────────────►│   ⑤ message.new → B
+  │             │             │             │             │   ══ ①–⑤ repeat for the reply
+  │◄────────────┤             │             │             │   ⑥ message.ack → A
+```
+
+- **The sender gets its own message back through Redis.** Replica 1 is not treated specially: it
+  receives its own `PUBLISH` on its own subscription (②) and delivers from there. That leaves exactly
+  **one** delivery path to any socket — `subscriber → ConnectionManager.broadcast` — instead of one
+  path for local sockets and a second for remote ones. It is also why the `SUBSCRIBE` back in diagram
+  C must complete before the socket is allowed to send anything.
+- **What happens between ② and ④:** the subscriber's reader task takes the message off Redis
+  (`get_message`), decodes the JSON back into a domain `Message`, and hands it to the local
+  `ConnectionManager`, which writes a `message.new` frame to every socket in that conversation.
+- **⑥ can arrive before ④.** The `message.new` frames are written by the subscriber task and the ack
+  by the receive-loop task — two independent tasks with no ordering between them. A client must not
+  assume the ack comes first.
+- **Replica 2 never reads Postgres here.** The entire message travels inside the Redis payload, so
+  fan-out costs one `PUBLISH` plus one decode per replica — no extra database queries.
+
+#### F. Teardown
+
+```
+  ── one socket goes away ──────────────────────────────────────────────────────
+  WebSocketDisconnect (or an unexpected error → close 1011)
+        ▼
+  finally: registry.leave(conversation, connection)
+        ▼
+  manager.unregister() → was that the LAST local socket for this conversation?
+        ├─ no  → keep the subscription; other local sockets still need the channel
+        └─ yes → subscriber.unsubscribe() → UNSUBSCRIBE conv:{id}
+        ▼
+  connection_id contextvar reset
+
+  ── the whole replica goes away (SIGTERM) ─────────────────────────────────────
+  connection_manager.close_all() → every live socket closed 1001
+        │                          (bounded by SHUTDOWN_DRAIN_TIMEOUT_SECONDS)
+        ▼
+  subscriber.stop() → reader task cancelled, pub/sub connection closed
+        ▼
+  redis.aclose() → engine.dispose()
+```
+
+While the replica is running, the subscriber also **repairs itself**: if a read from Redis fails, it
+logs, waits 500 ms, rebuilds the pub/sub connection, and re-`SUBSCRIBE`s every channel it still needs.
+A brief Redis outage therefore doesn't cost the replica its subscriptions. Messages published *during*
+the outage are lost by pub/sub and recovered instead by the client's next `last_seen_seq` replay.
+
+#### Where each diagram lives in the code
+
+| Diagram | Files |
+|---|---|
+| B — boot wiring | `app.py:44-83` |
+| C — connect, auth, join, replay | `realtime/websocket.py:59-164`; `realtime/conversation_registry.py:38-53` |
+| D — validate, persist, publish, ack | `realtime/websocket.py:167-217`; `application/services/message_exchange.py:38-67` |
+| E — publish, fan-out, local delivery | `outbound/redis/` (all four files); `realtime/connection_manager.py:83-98` |
+| F — leave, unsubscribe, drain | `realtime/conversation_registry.py:55-59`; `app.py:72-83` |
+
 ### 8.1 Boot / lifespan / composition root
 
 Entry: `main.py:main` loads settings and calls `uvicorn.run("dizzchat.app:app", …, log_config=None)`
@@ -717,10 +903,8 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 - **Layout mirrors the source.** `tests/` follows `contexts/{identity,messaging}` down through
   `domain/`, `application/`, `infrastructure/{api,security,redis}`, plus root `tests/test_health.py`
   and `tests/test_logging.py`.
-- **Scale.** 125 test functions across 30 files. Heaviest: `test_websocket_routes.py` (13),
-  `test_conversation_routes.py` (9), `test_message.py` (8). *(Note: the `.pytest_cache` nodeids are
-  stale — they reference the pre-rename `conversations` context path — so trust a fresh
-  `uv run pytest`, not the cache.)*
+- **Scale.** 130 tests across 30 files. Heaviest: `test_websocket_routes.py` (13),
+  `test_conversation_routes.py` (9), `test_message.py` (8).
 - **Fakes over infrastructure.** Almost every test uses in-memory fakes (`tests/contexts/*/fakes.py`)
   — fake repositories, hasher, token service, broadcaster, responder, `FixedClock`, etc. — so unit
   tests need no DB or network.
@@ -770,28 +954,7 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 
 ---
 
-## 16. As-built vs. the old design plan
-
-A pre-build design plan preceded the code; several things changed during implementation. The plan is
-kept out of the shipped repo, but the table below is a record of what changed during the build (the
-code remains the final authority):
-
-| Topic | Old plan | As-built (this guide) |
-|---|---|---|
-| Bounded contexts | **3** (Identity, Conversations, Realtime Messaging) | **2** — `identity` + `messaging` (realtime lives inside `messaging`) |
-| WS inbound frames | `auth`, `message.send`, `history.request`, `typing` | only `auth` + `message.send` |
-| WS outbound frames | incl. `history`, `auth.error` | `auth.ok`, `message.new`, `message.ack`, `error` |
-| History on the socket | `history.request` → `history` frame | served over REST `GET /conversations/{id}/messages`; reconnect uses `last_seen_seq` replay as `message.new` |
-| `seq` field | a distinct field alongside `id` | no separate field — the bigserial `id` **is** the seq |
-| `/metrics` | mentioned as a possible bonus | not built; only `/health` exists |
-| "shared kernel" | named concept | fulfilled by the `shared/` package (no package literally named `shared_kernel`) |
-
-Everything else in the plan (first-message auth + close codes, persist-before-broadcast, uniform
-Redis delivery, the two delivery guarantees) matched the code all along.
-
----
-
-## 17. Glossary & quick-answer index
+## 16. Glossary & quick-answer index
 
 **Glossary**
 - **Bounded context** — an independent model + vocabulary with its own boundary (`identity`,
@@ -816,7 +979,10 @@ Redis delivery, the two delivery guarantees) matched the code all along.
 **Where do I look to answer…**
 - *How does auth work?* → [§8.2](#82-rest-auth-auth), [§11](#11-security-model);
   `contexts/identity/…`.
-- *How does a message travel end to end?* → [§8.4](#84-websocket-lifecycle-wsconversationsid--the-core)–[§8.5](#85-redis-fan-out).
+- *Show me the whole flow in one picture.* → [§8.0](#80-the-whole-flow-in-one-picture) (six diagrams,
+  boot → connect → send → fan-out → teardown, each step cited to code).
+- *How does a message travel end to end?* → [§8.0](#80-the-whole-flow-in-one-picture) for the diagrams,
+  then [§8.4](#84-websocket-lifecycle-wsconversationsid--the-core)–[§8.5](#85-redis-fan-out) for the prose.
 - *What's the wire format?* → [§9](#9-real-time-protocol-reference); `realtime/protocol.py`.
 - *What are the delivery guarantees?* → [§10](#10-delivery-guarantees).
 - *What's in the database?* → [§7](#7-database-schema); `migrations/versions/`.

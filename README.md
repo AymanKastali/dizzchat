@@ -12,8 +12,20 @@ replay, and are idempotent per client-supplied key.
 PostgreSQL · Redis pub/sub · JWT auth (argon2 password hashing) · Docker Compose.
 
 **Architecture:** a DDD hexagonal modular monolith with two bounded contexts — `identity` and
-`messaging` — plus a small shared kernel. See [Architecture](#architecture) below, or
-[SYSTEM_GUIDE.md](./SYSTEM_GUIDE.md) for a full deep-dive (design, decisions, flows, testing).
+`messaging` — plus a small shared kernel. Summarised in [Architecture](#architecture) below.
+
+### The docs
+
+| Doc | What's in it |
+|---|---|
+| **README.md** (you are here) | how to run it, configuration, and the full REST + WebSocket API reference |
+| **[SYSTEM_GUIDE.md](./SYSTEM_GUIDE.md)** | how the system behaves — flows, diagrams, schema, guarantees. The source of truth |
+| **[ARCHITECTURE.md](./ARCHITECTURE.md)** | why it's shaped this way, and what was ruled out |
+| **[NOTES.md](./NOTES.md)** | deliberate scope cuts and self-critique |
+
+> **Start here:** [SYSTEM_GUIDE.md § 8.0 — The whole flow in one picture](./SYSTEM_GUIDE.md#80-the-whole-flow-in-one-picture).
+> Six diagrams trace one message end to end — topology, boot, connect + auth, the send pipeline,
+> Redis fan-out across both replicas, teardown — with every step cited to code.
 
 ---
 
@@ -109,6 +121,26 @@ injects the container values directly; `.env.example` is the template for local 
 All request/response bodies are JSON. Authenticated routes expect
 `Authorization: Bearer <access_token>`; a missing token returns `401 "missing bearer token"` and an
 invalid or expired one returns `401 "invalid or expired access token"`.
+
+### Error responses
+
+Domain and auth failures return a single consistent envelope:
+
+```jsonc
+{ "detail": "conversation not found: 8f1c…" }        // 400 · 401 · 403 · 404 · 409 · 422
+```
+
+Request-shape failures caught by Pydantic at the boundary return FastAPI's structured validation body,
+which names the offending field:
+
+```jsonc
+{ "detail": [ { "type": "missing", "loc": ["body", "password"],
+                "msg": "Field required" } ] }                // 422
+```
+
+Domain errors are mapped to status codes centrally, one handler per error type, so services raise
+domain errors and never construct HTTP responses
+(`contexts/identity/infrastructure/inbound/api/errors.py`, same pattern in `messaging`).
 
 ### Identity — `/auth`
 
@@ -278,6 +310,10 @@ there is a single uniform delivery path and no double-delivery.
 
 Because a WebSocket outlives any single request, message writes use session-scoped outbound adapters
 that open one transaction per message rather than reusing a request-scoped session.
+
+For the same flow as diagrams — client → replica → Postgres → Redis → the other replica → both
+clients, step by step — see
+[SYSTEM_GUIDE.md § 8.0](./SYSTEM_GUIDE.md#80-the-whole-flow-in-one-picture).
 
 ---
 
