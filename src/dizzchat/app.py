@@ -31,9 +31,11 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.router import (
 from dizzchat.contexts.messaging.infrastructure.outbound.redis import (
     RedisConversationSubscriber,
     RedisMessageBroadcaster,
+    RedisRateLimiter,
 )
 from dizzchat.logging import configure_logging
 from dizzchat.shared.infrastructure.inbound.api.health import router as health_router
+from dizzchat.shared.infrastructure.outbound import SystemClock
 from dizzchat.shared.infrastructure.outbound.database import create_engine, create_session_factory
 from dizzchat.shared.infrastructure.outbound.migrations import run_migrations
 from dizzchat.shared.infrastructure.outbound.redis_client import create_redis_client
@@ -67,6 +69,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     await subscriber.start()
     app.state.message_broadcaster = RedisMessageBroadcaster(redis_client)
     app.state.conversation_registry = ConversationRegistry(connection_manager, subscriber)
+    # Second use of Redis, unrelated to fan-out: the per-user frame counter, shared so a client
+    # cannot reset its quota by reconnecting to the other replica.
+    app.state.rate_limiter = RedisRateLimiter(
+        redis_client,
+        SystemClock(),
+        limit=settings.ws_rate_limit_messages,
+        window_seconds=settings.ws_rate_limit_window_seconds,
+    )
     try:
         yield
     finally:

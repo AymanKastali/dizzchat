@@ -118,6 +118,12 @@ domain.
     the socket joins live delivery *before* replay runs (so nothing is missed), delivery is
     at-least-once and unordered at the seam — the client applies each `id` at most once (a seen-set)
     and orders by it. Combines naturally with cursor pagination.
+- **Rate limiting (Redis, second use):** the same Redis also carries a per-user fixed-window counter,
+  `ratelimit:ws:{user_id}:{window}`, incremented for every inbound frame in the receive loop before
+  parsing. Because the counter is shared, one user's quota holds across all of their sockets and both
+  replicas; over the limit the server replies with an `error` frame and keeps the socket open. The
+  port (`realtime/rate_limit.py`) sits beside its consumer rather than in `application/ports.py` — it
+  guards the transport, not a use case. It fails **open** if Redis is unreachable, deliberately.
 - **Resilience:** mock-AI generation and each DB/Redis call are wrapped so a failure emits an
   `error` frame and is logged — never crashing the socket or worker. The mock reply is an `async`,
   non-blocking responder (no I/O) awaited inline in `MessageExchange`; the non-negotiable is that it
@@ -164,6 +170,13 @@ connect, so revoking it stops a user posting immediately.
   know): cheapest way to get multiple users into a room, but it reduces authorization to a capability
   URL. Membership is owner-granted by email instead — argued in
   [NOTES.md § Multi-user conversations](./NOTES.md#multi-user-conversations--the-reading-i-changed-my-mind-about).
+- **Sliding-window rate limiting** (a Redis sorted set trimmed on every frame): exact, with no
+  boundary burst, but it costs extra round trips and per-request cleanup for precision a 20-per-10s
+  limit doesn't need. A fixed-window `INCR` on a self-expiring key was chosen instead; the 2×-across-a-
+  boundary flaw is stated in [NOTES.md](./NOTES.md#deliberate-decisions).
+- **Rate limiting inside `MessageExchange`:** would place the rule in the core use case, but malformed
+  frames never reach a use case, so garbage floods could not be counted. The check sits in the socket
+  receive loop instead.
 
 ---
 

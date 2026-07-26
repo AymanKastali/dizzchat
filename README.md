@@ -107,6 +107,8 @@ injects the container values directly; `.env.example` is the template for local 
 | `ACCESS_TOKEN_TTL_SECONDS`       | `900`          | 15 minutes                                                   |
 | `REFRESH_TOKEN_TTL_SECONDS`      | `1209600`      | 14 days                                                      |
 | `WS_AUTH_TIMEOUT_SECONDS`        | `5.0`          | time to send the first `auth` frame before close 4401        |
+| `WS_RATE_LIMIT_MESSAGES`         | `20`           | inbound frames a user may send per window; `0` disables      |
+| `WS_RATE_LIMIT_WINDOW_SECONDS`   | `10`           | the rate-limit window, counted in Redis so it spans replicas |
 | `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `10.0`         | graceful socket-drain budget on shutdown                     |
 | `CORS_ALLOW_ORIGINS`             | `[]`           | JSON array; credentials only for explicit origins, never `*` |
 
@@ -276,8 +278,29 @@ The envelope is `{"type": ..., "payload": {...}}` for data frames and
 | 1011 | internal error — e.g. the Redis fan-out subscription could not be established (fail closed) |
 | 1001 | server shutting down (graceful socket drain)                                        |
 
-Bad JSON or an invalid `message.send` frame returns an `error` frame and keeps the socket open; only
-auth/ownership failures close it.
+Bad JSON, an invalid `message.send` frame, or exceeding the rate limit returns an `error` frame and
+keeps the socket open; only auth/ownership failures close it.
+
+### Rate limiting
+
+Each user may send `WS_RATE_LIMIT_MESSAGES` inbound frames per `WS_RATE_LIMIT_WINDOW_SECONDS`
+(default **20 per 10s**). Over the limit:
+
+```json
+{"type": "error", "error": "rate limit exceeded"}
+```
+
+The socket **stays open** — a burst costs you the frame, not the connection, so there is nothing to
+reconnect and replay. Details worth knowing:
+
+- **Per user, not per socket or per conversation.** The counter lives in Redis, so the quota holds
+  across every socket that user has open *and* across both replicas — reconnecting to `:8001` does
+  not buy a fresh allowance.
+- **Every inbound frame counts**, including malformed JSON, so unparseable floods aren't free.
+- A refused frame is never persisted, never broadcast, and never reaches the mock assistant.
+- Set `WS_RATE_LIMIT_MESSAGES=0` to disable the check.
+- If Redis is unreachable the limiter **fails open** (allows the frame) and logs a warning — it is a
+  protection, not an authorization rule.
 
 ### Idempotent send
 
@@ -325,8 +348,8 @@ src/dizzchat/
                              replay_messages, ensure_conversation_access; ports.py
       infrastructure/
         inbound/api/         REST routers/controllers + realtime/ (websocket, protocol,
-                             connection_manager, conversation_registry, dependencies)
-        outbound/            mock assistant, redis fan-out, SQLAlchemy repositories,
+                             connection_manager, conversation_registry, rate_limit, dependencies)
+        outbound/            mock assistant, redis fan-out + rate limiter, SQLAlchemy repositories,
                              session-scoped per-message unit-of-work adapters
   shared/                    clock, database/session factory, migration runner, redis client, health
 ```
@@ -450,6 +473,22 @@ Two negative checks worth showing: a third user who was never invited gets `403`
 `GET /conversations/<id>/messages` and is closed with `4403` on connect; and bob, a participant but
 not the owner, gets `403` from `PATCH /conversations/<id>`.
 
+### 7. Rate limiting, shared across replicas
+
+Set `WS_RATE_LIMIT_MESSAGES: 3` and `WS_RATE_LIMIT_WINDOW_SECONDS: 10` under **both** api services in
+`docker-compose.yml`, then `docker compose up --build`.
+
+1. As alice, open one socket on `ws://localhost:8000/ws/conversations/<id>` and send four
+   `message.send` frames quickly. The first three behave normally; the fourth returns
+   `{"type":"error","error":"rate limit exceeded"}` and the socket stays connected. Wait ten seconds
+   and a send succeeds again.
+2. **The shared-counter proof:** with alice connected on *both* `:8000` and `:8001`, send two frames
+   on each. The fourth is refused even though it is only the second on that replica — the count lives
+   in Redis, not in either process.
+3. Bob sending at the same time is unaffected: the quota is per user.
+4. `GET /conversations/<id>/messages` shows only the accepted sends — a refused frame is never
+   persisted.
+
 The full frame and close-code reference is in [WebSocket protocol](#websocket-protocol) above.
 
 ---
@@ -472,8 +511,16 @@ features that already meet spec — not defects. Each production follow-up is re
 - **Replay is unbounded.** `last_seen_seq` replays the full tail with no page/deadline cap, so a
   long-absent client can trigger a large replay. Production would cap it and fall back to the REST
   history endpoint past a threshold.
-- **No streamed assistant reply, typing indicators/presence, or per-user rate limiting.** All three
-  are optional Req-3 nice-to-haves; the mock returns a single `message.new` (`"You said: …"`).
+- **No streamed assistant reply and no typing indicators/presence.** Two of the three Req-3
+  nice-to-haves; the third, per-user rate limiting, **is** built (see
+  [Rate limiting](#rate-limiting)). The mock returns a single `message.new` (`"You said: …"`) rather
+  than token chunks, and there are no presence frames — presence needs cross-replica ephemeral state
+  (TTL heartbeats, plus reconciliation when a replica dies holding sockets), which is a larger piece
+  of work than it looks.
+- **The rate limit is a fixed window, and covers the socket only.** A client can send up to 2× the
+  limit back to back across a window boundary; a sliding window would be exact but costs extra Redis
+  ops per frame. The REST endpoints are not rate limited — that needs request middleware, which is a
+  different mechanism from the socket's per-frame check.
 - **The assistant replies to every user message, including in a multi-user room.** With three people
   in a conversation the mock answers each of them, which is noisy. Gating the reply on an `@ai`
   mention is the obvious refinement; see `NOTES.md`.

@@ -2,13 +2,15 @@
 
 Domain errors are translated to close codes (auth 4401, forbidden 4403) or ``error`` frames here,
 because FastAPI's HTTP exception handlers do not apply to WebSocket connections. A failed message
-handling (DB or mock-AI) is reported as an ``error`` frame and never drops the socket.
+handling (DB or mock-AI) is reported as an ``error`` frame and never drops the socket, and so is a
+frame that exceeds the sender's rate limit.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -42,6 +44,7 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.dependencie
     ConversationRegistryDep,
     MessageExchangeDep,
     MessageReplayerDep,
+    RateLimiterDep,
 )
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.protocol import (
     AuthFrame,
@@ -65,6 +68,7 @@ async def conversation_ws(
     exchange: MessageExchangeDep,
     registry: ConversationRegistryDep,
     replayer: MessageReplayerDep,
+    limiter: RateLimiterDep,
 ) -> None:
     await websocket.accept()
 
@@ -107,7 +111,7 @@ async def conversation_ws(
             # and order by the seq each frame carries as ``id``.
             await _replay_missed(connection, replayer, conversation, last_seen_seq)
             await _receive_loop(
-                websocket, connection, conversation, sender_id, exchange, tokens, token
+                websocket, connection, conversation, sender_id, exchange, tokens, token, limiter
             )
         except WebSocketDisconnect:
             pass
@@ -172,11 +176,23 @@ async def _receive_loop(
     exchange: MessageExchangeDep,
     tokens: TokenServiceDep,
     token: str,
+    limiter: RateLimiterDep,
 ) -> None:
     while True:
         try:
-            raw = await websocket.receive_json()
+            raw: Any = await websocket.receive_json()
         except ValueError:
+            # A non-JSON payload. Held as ``None`` rather than answered here, so that it still
+            # passes the rate limit below: a flood of garbage costs a client its quota too.
+            raw = None
+
+        # Counted per frame, before any parsing, and keyed on the user (``sender_id`` wraps their
+        # id), so the quota covers every socket they hold on every replica.
+        if not await limiter.allow(sender_id.value):
+            await connection.send(protocol.error("rate limit exceeded"))
+            continue
+
+        if raw is None:
             await connection.send(protocol.error("invalid JSON"))
             continue
 

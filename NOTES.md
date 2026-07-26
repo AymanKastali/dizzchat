@@ -162,6 +162,40 @@ Because delete never touched the message or participant rows, restore needs no d
 choosing soft-delete in the first place, and it's why this landed as one endpoint and one repository
 method rather than a recovery process.
 
+### Rate limiting lives on the transport, counts every frame, and fails open
+The counter is a Redis fixed-window `INCR` keyed `ratelimit:ws:{user_id}:{window}`. Four choices, each with
+the alternative I rejected:
+
+**Per user, in Redis — not per socket, in the process.** A per-process counter would let a client double its
+allowance by opening a second socket, or reset it entirely by reconnecting to the other replica. Keying on the
+user in the Redis both replicas already share makes the quota mean what it says. This is also why the adapter
+has an integration test against a real Redis with *two* limiter instances: fakes cannot prove a shared counter.
+
+**Checked in `_receive_loop`, not inside `MessageExchange`.** The limit protects the transport — how fast a
+socket may be written to — not a business rule, so it sits with the ports declared beside their consumer
+(`realtime/rate_limit.py`, mirroring `ConversationSubscriber`) rather than in `application/ports.py`. Putting
+it in the use case was the alternative, and it fails the requirement below: malformed frames never reach a use
+case, so they could not be counted.
+
+**Every inbound frame counts, including unparseable ones.** A client that floods the socket with garbage costs
+the server real work (a JSON parse attempt and a reply per frame); counting only valid `message.send` frames
+would leave that free. The cost is that a buggy client burns quota on frames it never intended as messages.
+
+**Over-limit is an `error` frame, not a close code.** The socket stays open, consistent with every other
+recoverable failure here (bad JSON, invalid frame, DB error). Closing with a `4429` was the alternative and is
+harsher than the offence: a brief burst from a legitimate client would cost it the connection and force a
+reconnect plus replay. The client can't currently tell *when* to retry — the `error` envelope carries only a
+string, and adding `retry_after_seconds` was left out as unneeded for this protocol.
+
+**Fail open when Redis is unreachable**, with a logged warning. A rate limit is a protection, not an
+authorization rule; silencing a legitimate client because of an infrastructure hiccup is the worse failure.
+Mostly theoretical here — `registry.join` already fails *closed* (`1011`) if Redis is down, so a socket can't
+reach the receive loop without it — but the limiter shouldn't be the thing that decides that.
+
+The accepted flaw is the fixed window: a client that spends its quota at the end of one window and the next
+window's immediately can send `2 * limit` back to back. A sliding window (a sorted set trimmed per call) is
+exact but costs extra round trips and per-request cleanup for precision that a 20-per-10s limit doesn't need.
+
 ### Modular monolith, not microservices
 One deployable with two bounded contexts kept behind module boundaries (hexagonal layering, ports
 and adapters). This preserves a clean split-point later without paying distributed-systems cost now.
@@ -177,14 +211,16 @@ knowingly, and each line is the real consequence rather than a reassurance:
   (Remedy below.)
 - **Bounded replay.** A client away for a long time can trigger an arbitrarily large replay on one socket.
   Fine at assignment scale, an availability problem at real scale. (Remedy below.)
-- **Per-user rate limiting.** An authenticated client can send as fast as it likes; the only gate on the
-  send path is token validity. This is the most obvious production gap.
+- **A fixed rate-limit window, and only on the socket.** Rate limiting *is* built (see the decision below),
+  but a fixed window lets a client send up to 2× the limit across a boundary, and the REST endpoints have no
+  equivalent gate — `/auth/login` in particular is unthrottled, so nothing slows a password-guessing loop.
 - **Retention and an audit trail for delete/restore.** Restore is built (see the decision below), but a
   soft-deleted conversation stays restorable forever — nothing purges it — and no record says who deleted or
   restored it. `deleted_at` is a state flag, not a history.
-- **Streamed assistant replies and typing/presence indicators.** The mock returns one whole `message.new`.
-  Streaming would need chunk framing and a terminal marker; presence would need cross-replica state, which
-  nothing in the system tracks today.
+- **Streamed assistant replies and typing/presence indicators.** The two Req-3 nice-to-haves not taken. The
+  mock returns one whole `message.new`; streaming would need chunk framing, a terminal marker, and an answer
+  for what replay sends (the finished message, never chunks). Presence would need cross-replica ephemeral
+  state — TTL heartbeats plus reconciliation when a replica dies holding sockets — which nothing tracks today.
 - **`/metrics`, OAuth login, load-test numbers.** The other three bonuses, untaken — only one was allowed.
 - **REST correlation ids.** Every WebSocket connection tags its logs with a `connection_id`; REST requests
   have no equivalent, so an HTTP-side investigation has less to grep on.
