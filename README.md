@@ -156,7 +156,8 @@ refresh token.
 
 ### Messaging — `/conversations`
 
-All routes require a Bearer access token and operate only on the caller's own conversations.
+All routes require a Bearer access token and operate only on conversations the caller **takes part
+in**.
 
 | Method & path                          | Body                     | Response                                                     |
 |----------------------------------------|--------------------------|--------------------------------------------------------------|
@@ -181,6 +182,28 @@ MessageResponse      { id, conversation_id, sender_id, role, content, created_at
 
 `MessageResponse.id` is the message's monotonic sequence number (`seq`). `sender_id` is `null` for
 assistant messages.
+
+### Participants — many users in one conversation
+
+A conversation has an **owner** and a set of **participants**. Every participant may open a socket,
+send, and read history; only the owner may rename, delete, or change the membership. The owner is a
+participant from the moment the conversation is created, and cannot be removed.
+
+| Method & path                                        | Body        | Who        | Response                          |
+|------------------------------------------------------|-------------|------------|-----------------------------------|
+| `POST   /conversations/{id}/participants`            | `{email}`   | owner      | `204` (idempotent)                |
+| `GET    /conversations/{id}/participants`            | —           | any member | `200` `[{user_id, joined_at}]`    |
+| `DELETE /conversations/{id}/participants/{user_id}`  | —           | owner, or the user themselves (leaving) | `204`  |
+
+- The invited `email` must belong to a registered user, otherwise `404`.
+- Re-inviting an existing participant is a no-op that still returns `204`, so a client can retry
+  safely.
+- Removing the owner returns `409`.
+- Someone who is not a participant gets `403` on history and participants, and their WebSocket is
+  closed with `4403`.
+
+Once two users are participants, **every message either of them sends is broadcast to both** — and
+to their sockets on any replica, via Redis. See the [Demo](#demo) for a two-user walkthrough.
 
 ---
 
@@ -371,6 +394,34 @@ After `auth.ok` the server replays the conversation's `message.new` frames. The 
 to replica `:8000` and read back from `:8001` — proving fan-out state is shared across replicas over
 Redis.
 
+### 5. Two users in one conversation, one on each replica
+
+This is the multi-user broadcast, end to end. Keep the first user (call them **alice**) and her
+conversation from the steps above.
+
+1. Sign a second user up: `POST http://localhost:8000/auth/signup` with
+   `{"email":"bob@example.com","password":"demo-password-456"}`, then `POST /auth/login` with the
+   same body → copy **bob's** `access_token`.
+2. As **alice**, invite bob:
+   `POST http://localhost:8000/conversations/<id>/participants` with header
+   `Authorization: Bearer <alice_token>` and body `{"email":"bob@example.com"}` → `204`.
+3. Confirm the room: `GET http://localhost:8001/conversations/<id>/participants` as either user →
+   two entries. `GET http://localhost:8001/conversations` as bob now lists the conversation he was
+   invited to.
+4. Open **two** WebSocket Requests to the *same* conversation on *different* replicas — alice on
+   `ws://localhost:8000/ws/conversations/<id>`, bob on `ws://localhost:8001/ws/conversations/<id>` —
+   and send each user's own `auth` frame.
+5. Send a `message.send` from alice. **Bob's socket receives `message.new`** with alice's
+   `sender_id`, followed by the assistant's reply; alice additionally receives her own
+   `message.ack`. Send from bob and alice receives it the same way.
+
+The message crossed users *and* replicas: persisted by `:8000`, published to Redis, delivered to a
+socket held by `:8001`.
+
+Two negative checks worth showing: a third user who was never invited gets `403` from
+`GET /conversations/<id>/messages` and is closed with `4403` on connect; and bob, a participant but
+not the owner, gets `403` from `PATCH /conversations/<id>`.
+
 The full frame and close-code reference is in [WebSocket protocol](#websocket-protocol) above.
 
 ---
@@ -394,6 +445,14 @@ features that already meet spec — not defects. Each production follow-up is re
   history endpoint past a threshold.
 - **No streamed assistant reply, typing indicators/presence, or per-user rate limiting.** All three
   are optional Req-3 nice-to-haves; the mock returns a single `message.new` (`"You said: …"`).
+- **The assistant replies to every user message, including in a multi-user room.** With three people
+  in a conversation the mock answers each of them, which is noisy. Gating the reply on an `@ai`
+  mention is the obvious refinement; see `NOTES.md`.
+- **A removed participant keeps *receiving* until they disconnect.** Access is checked once at
+  connect, so revoking a membership does not close an already-open socket. Their *sends* are blocked
+  immediately (every message re-checks membership), and a reconnect is refused with `4403`. Closing
+  live sockets on removal needs a cross-replica revocation signal — recorded in `NOTES.md`, not
+  built.
 - **One bonus taken — delivery guarantees.** The assignment asks for at most one; no `/metrics`
   (Prometheus), OAuth login, or load-test harness.
 - **Correlation ids cover the WebSocket path.** Each connection tags its log lines with a

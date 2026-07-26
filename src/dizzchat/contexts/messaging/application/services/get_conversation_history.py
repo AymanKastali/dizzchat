@@ -7,13 +7,13 @@ from dizzchat.contexts.messaging.domain.conversation import (
     ConversationId,
     ConversationNotFound,
     ConversationRepository,
-    OwnerId,
+    ParticipantId,
 )
 from dizzchat.contexts.messaging.domain.message import MessageId, MessageRepository
 
 
 class GetConversationHistory:
-    """Return a page of a conversation's messages, newest first, for its owner."""
+    """Return a page of a conversation's messages, newest first, for one of its participants."""
 
     def __init__(self, conversations: ConversationRepository, messages: MessageRepository) -> None:
         self._conversations = conversations
@@ -23,14 +23,14 @@ class GetConversationHistory:
         self,
         *,
         conversation_id: ConversationId,
-        owner_id: OwnerId,
+        participant_id: ParticipantId,
         before: MessageId | None,
         limit: int,
     ) -> MessagePage:
         conversation = await self._conversations.get(conversation_id)
         if conversation is None:
             raise ConversationNotFound(conversation_id)
-        conversation.ensure_owned_by(owner_id)
+        conversation.ensure_participant(participant_id)
         # Over-fetch by one to learn whether an older page exists without a second query.
         fetched = await self._messages.list_history(conversation_id, before=before, limit=limit + 1)
         has_more = len(fetched) > limit

@@ -9,8 +9,9 @@ fakes, and lets the Redis broadcaster sit behind ``MessageBroadcaster`` unknown 
 from __future__ import annotations
 
 from typing import Protocol
+from uuid import UUID
 
-from dizzchat.contexts.messaging.domain.conversation import ConversationId, OwnerId
+from dizzchat.contexts.messaging.domain.conversation import ConversationId, ParticipantId
 from dizzchat.contexts.messaging.domain.message import (
     ClientMessageId,
     Message,
@@ -21,10 +22,25 @@ from dizzchat.contexts.messaging.domain.message import (
 
 
 class ConversationAccess(Protocol):
-    """Asserts an owner may access a conversation, within its own read transaction."""
+    """Asserts a user takes part in a conversation, within its own read transaction."""
 
-    async def ensure(self, *, conversation_id: ConversationId, owner_id: OwnerId) -> None:
+    async def ensure(
+        self, *, conversation_id: ConversationId, participant_id: ParticipantId
+    ) -> None:
         """Return normally if allowed, or raise a conversation domain error."""
+        ...
+
+
+class UserDirectory(Protocol):
+    """Resolves a user id by email, so a conversation can admit someone the inviter names.
+
+    The one place Messaging needs to ask about a user it does not own. Returning a bare ``UUID``
+    (rather than an Identity ``User``) keeps Identity's domain types out of this context; the
+    adapter that implements it is the anti-corruption layer.
+    """
+
+    async def find_id_by_email(self, email: str) -> UUID | None:
+        """Return the id of the user with this email, or ``None`` if there is none."""
         ...
 
 

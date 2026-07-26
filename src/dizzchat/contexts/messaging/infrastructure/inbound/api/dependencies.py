@@ -11,12 +11,16 @@ from typing import Annotated
 from fastapi import Depends
 
 from dizzchat.contexts.messaging.application.services import (
+    AddParticipant,
     CreateConversation,
     DeleteConversation,
     GetConversationHistory,
     ListConversations,
+    ListParticipants,
+    RemoveParticipant,
     RenameConversation,
 )
+from dizzchat.contexts.messaging.infrastructure.outbound.identity import IdentityUserDirectory
 from dizzchat.contexts.messaging.infrastructure.outbound.persistence import (
     SqlAlchemyConversationRepository,
     SqlAlchemyMessageRepository,
@@ -47,6 +51,20 @@ def provide_get_conversation_history(session: SessionDep) -> GetConversationHist
     )
 
 
+def provide_add_participant(session: SessionDep, clock: ClockDep) -> AddParticipant:
+    return AddParticipant(
+        SqlAlchemyConversationRepository(session), IdentityUserDirectory(session), clock
+    )
+
+
+def provide_list_participants(session: SessionDep) -> ListParticipants:
+    return ListParticipants(SqlAlchemyConversationRepository(session))
+
+
+def provide_remove_participant(session: SessionDep) -> RemoveParticipant:
+    return RemoveParticipant(SqlAlchemyConversationRepository(session))
+
+
 CreateConversationDep = Annotated[CreateConversation, Depends(provide_create_conversation)]
 ListConversationsDep = Annotated[ListConversations, Depends(provide_list_conversations)]
 RenameConversationDep = Annotated[RenameConversation, Depends(provide_rename_conversation)]
@@ -54,3 +72,6 @@ DeleteConversationDep = Annotated[DeleteConversation, Depends(provide_delete_con
 GetConversationHistoryDep = Annotated[
     GetConversationHistory, Depends(provide_get_conversation_history)
 ]
+AddParticipantDep = Annotated[AddParticipant, Depends(provide_add_participant)]
+ListParticipantsDep = Annotated[ListParticipants, Depends(provide_list_participants)]
+RemoveParticipantDep = Annotated[RemoveParticipant, Depends(provide_remove_participant)]

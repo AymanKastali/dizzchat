@@ -9,7 +9,7 @@ from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from dizzchat.contexts.messaging.application.services import EnsureConversationAccess
-from dizzchat.contexts.messaging.domain.conversation import ConversationId, OwnerId
+from dizzchat.contexts.messaging.domain.conversation import ConversationId, ParticipantId
 from dizzchat.contexts.messaging.infrastructure.outbound.persistence.repositories import (
     SqlAlchemyConversationRepository,
 )
@@ -21,8 +21,10 @@ class SessionScopedConversationAccess:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def ensure(self, *, conversation_id: ConversationId, owner_id: OwnerId) -> None:
+    async def ensure(
+        self, *, conversation_id: ConversationId, participant_id: ParticipantId
+    ) -> None:
         async with self._session_factory() as session:
             await EnsureConversationAccess(SqlAlchemyConversationRepository(session)).execute(
-                conversation_id=conversation_id, owner_id=owner_id
+                conversation_id=conversation_id, participant_id=participant_id
             )

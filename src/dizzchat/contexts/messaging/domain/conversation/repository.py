@@ -12,10 +12,12 @@ from datetime import datetime
 from typing import Protocol
 
 from dizzchat.contexts.messaging.domain.conversation.conversation import Conversation
+from dizzchat.contexts.messaging.domain.conversation.participant import Participant
 from dizzchat.contexts.messaging.domain.conversation.value_objects import (
     ConversationId,
     ConversationTitle,
     OwnerId,
+    ParticipantId,
 )
 
 
@@ -30,8 +32,13 @@ class ConversationRepository(Protocol):
         title: ConversationTitle,
         created_at: datetime,
         updated_at: datetime,
+        participant_ids: frozenset[ParticipantId],
     ) -> None:
-        """Persist a newly started conversation."""
+        """Persist a newly started conversation together with its initial participants.
+
+        Taking the participants here (rather than leaving the caller to add them afterwards) keeps
+        the aggregate's "the owner is a participant" invariant intact across persistence.
+        """
         ...
 
     async def update(
@@ -46,9 +53,32 @@ class ConversationRepository(Protocol):
         ...
 
     async def get(self, conversation_id: ConversationId) -> Conversation | None:
-        """Return the active conversation with this id, or ``None`` if absent or deleted."""
+        """Return the active conversation with this id (participants included), or ``None``."""
         ...
 
-    async def list_for_owner(self, owner_id: OwnerId) -> list[Conversation]:
-        """Return the owner's active conversations, newest first."""
+    async def list_for_participant(self, participant_id: ParticipantId) -> list[Conversation]:
+        """Return the active conversations this user takes part in, newest first.
+
+        Includes the ones they own, since an owner is always a participant.
+        """
+        ...
+
+    async def add_participant(
+        self,
+        *,
+        conversation_id: ConversationId,
+        participant_id: ParticipantId,
+        joined_at: datetime,
+    ) -> None:
+        """Record a new membership. The caller has already checked it does not exist."""
+        ...
+
+    async def remove_participant(
+        self, *, conversation_id: ConversationId, participant_id: ParticipantId
+    ) -> None:
+        """Drop a membership."""
+        ...
+
+    async def list_participants(self, conversation_id: ConversationId) -> list[Participant]:
+        """Return the conversation's memberships with their join times, oldest first."""
         ...

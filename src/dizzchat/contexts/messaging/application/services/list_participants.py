@@ -1,4 +1,4 @@
-"""Ensure-conversation-access use case — the authorization check for joining a conversation."""
+"""List-participants use case — who is in this conversation."""
 
 from __future__ import annotations
 
@@ -6,24 +6,22 @@ from dizzchat.contexts.messaging.domain.conversation import (
     ConversationId,
     ConversationNotFound,
     ConversationRepository,
+    Participant,
     ParticipantId,
 )
 
 
-class EnsureConversationAccess:
-    """Assert that a user takes part in a conversation, raising a domain error otherwise.
-
-    Used at WebSocket connect so an unauthorized socket is rejected before it is registered for
-    broadcasts (and never sees a conversation it is not a member of).
-    """
+class ListParticipants:
+    """Return a conversation's memberships, readable by any of its participants."""
 
     def __init__(self, conversations: ConversationRepository) -> None:
         self._conversations = conversations
 
     async def execute(
         self, *, conversation_id: ConversationId, participant_id: ParticipantId
-    ) -> None:
+    ) -> list[Participant]:
         conversation = await self._conversations.get(conversation_id)
         if conversation is None:
             raise ConversationNotFound(conversation_id)
         conversation.ensure_participant(participant_id)
+        return await self._conversations.list_participants(conversation_id)

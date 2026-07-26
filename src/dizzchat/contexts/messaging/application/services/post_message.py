@@ -6,7 +6,7 @@ from dizzchat.contexts.messaging.domain.conversation import (
     ConversationId,
     ConversationNotFound,
     ConversationRepository,
-    OwnerId,
+    ParticipantId,
 )
 from dizzchat.contexts.messaging.domain.message import (
     ClientMessageId,
@@ -52,7 +52,9 @@ class PostMessage:
         conversation = await self._conversations.get(conversation_id)
         if conversation is None:
             raise ConversationNotFound(conversation_id)
-        conversation.ensure_owned_by(OwnerId(sender_id.value))
+        # Re-checked on every message, so revoking a membership stops that user posting immediately
+        # (even on an already-open socket, whose access was checked only at connect).
+        conversation.ensure_participant(ParticipantId(sender_id.value))
 
         if client_message_id is not None:
             existing = await self._messages.find_by_client_message_id(

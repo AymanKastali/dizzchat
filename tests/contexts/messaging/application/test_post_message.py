@@ -5,11 +5,15 @@ from uuid import uuid4
 
 import pytest
 
-from dizzchat.contexts.messaging.application.services import CreateConversation, PostMessage
+from dizzchat.contexts.messaging.application.services import (
+    AddParticipant,
+    CreateConversation,
+    PostMessage,
+)
 from dizzchat.contexts.messaging.domain.conversation import (
     ConversationId,
     ConversationNotFound,
-    NotConversationOwner,
+    NotConversationParticipant,
     OwnerId,
 )
 from dizzchat.contexts.messaging.domain.message import (
@@ -21,6 +25,7 @@ from dizzchat.contexts.messaging.domain.message import (
 from tests.contexts.messaging.fakes import (
     FakeConversationRepository,
     FakeMessageRepository,
+    FakeUserDirectory,
     FixedClock,
 )
 
@@ -66,16 +71,37 @@ async def test_from_user_rejects_a_missing_conversation() -> None:
         )
 
 
-async def test_from_user_rejects_a_sender_who_is_not_the_owner() -> None:
+async def test_from_user_rejects_a_sender_who_is_not_a_participant() -> None:
     conversations, messages = FakeConversationRepository(), FakeMessageRepository()
     conversation_id = await _conversation_owned_by(conversations, OwnerId(uuid4()))
 
-    with pytest.raises(NotConversationOwner):
+    with pytest.raises(NotConversationParticipant):
         await PostMessage(conversations, messages, FixedClock(_NOW)).from_user(
             conversation_id=conversation_id,
             sender_id=SenderId(uuid4()),
             content=MessageContent("hijack"),
         )
+
+
+async def test_from_user_accepts_an_invited_participant_who_is_not_the_owner() -> None:
+    conversations, messages = FakeConversationRepository(), FakeMessageRepository()
+    clock = FixedClock(_NOW)
+    owner = OwnerId(uuid4())
+    conversation_id = await _conversation_owned_by(conversations, owner)
+    guest = uuid4()
+    await AddParticipant(
+        conversations, FakeUserDirectory({"guest@example.com": guest}), clock
+    ).execute(conversation_id=conversation_id, owner_id=owner, email="guest@example.com")
+
+    message, created = await PostMessage(conversations, messages, clock).from_user(
+        conversation_id=conversation_id,
+        sender_id=SenderId(guest),
+        content=MessageContent("hi from the guest"),
+    )
+
+    assert created is True
+    assert message.sender_id == SenderId(guest)
+    assert message.content.value == "hi from the guest"
 
 
 async def test_from_assistant_persists_an_assistant_message_without_a_sender() -> None:

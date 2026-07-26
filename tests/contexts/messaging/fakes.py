@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
+from uuid import UUID
 
 from dizzchat.contexts.messaging.domain.conversation import (
     Conversation,
     ConversationId,
     ConversationTitle,
     OwnerId,
+    Participant,
+    ParticipantId,
 )
 from dizzchat.contexts.messaging.domain.message import (
     ClientMessageId,
@@ -24,12 +27,15 @@ from dizzchat.contexts.messaging.domain.message import (
 class FakeConversationRepository:
     """In-memory ``ConversationRepository`` keyed by conversation id.
 
-    ``get``/``list_for_owner`` return detached copies, so only ``update`` persists a change —
-    mirroring the real adapter, which reconstructs domain objects from rows.
+    ``get``/``list_for_participant`` return detached copies, so only ``update`` and the
+    ``*_participant`` writes persist a change — mirroring the real adapter, which reconstructs
+    domain objects from rows. Memberships are stored separately from the aggregate (as the real
+    schema does) so ``joined_at`` can be served by ``list_participants``.
     """
 
     def __init__(self) -> None:
         self._by_id: dict[ConversationId, Conversation] = {}
+        self._participants: dict[ConversationId, dict[ParticipantId, datetime]] = {}
 
     async def create(
         self,
@@ -39,6 +45,7 @@ class FakeConversationRepository:
         title: ConversationTitle,
         created_at: datetime,
         updated_at: datetime,
+        participant_ids: frozenset[ParticipantId],
     ) -> None:
         self._by_id[conversation_id] = Conversation(
             id=conversation_id,
@@ -47,6 +54,7 @@ class FakeConversationRepository:
             created_at=created_at,
             updated_at=updated_at,
         )
+        self._participants[conversation_id] = dict.fromkeys(participant_ids, created_at)
 
     async def update(
         self,
@@ -65,16 +73,50 @@ class FakeConversationRepository:
         stored = self._by_id.get(conversation_id)
         if stored is None or stored.is_deleted:
             return None
-        return replace(stored)
+        return replace(stored, participant_ids=frozenset(self._joined(conversation_id)))
 
-    async def list_for_owner(self, owner_id: OwnerId) -> list[Conversation]:
+    async def list_for_participant(self, participant_id: ParticipantId) -> list[Conversation]:
         active = [
             stored
             for stored in self._by_id.values()
-            if stored.owner_id == owner_id and not stored.is_deleted
+            if participant_id in self._joined(stored.id) and not stored.is_deleted
         ]
         active.sort(key=lambda c: c.created_at, reverse=True)
-        return [replace(c) for c in active]
+        return [replace(c, participant_ids=frozenset(self._joined(c.id))) for c in active]
+
+    async def add_participant(
+        self,
+        *,
+        conversation_id: ConversationId,
+        participant_id: ParticipantId,
+        joined_at: datetime,
+    ) -> None:
+        self._participants.setdefault(conversation_id, {})[participant_id] = joined_at
+
+    async def remove_participant(
+        self, *, conversation_id: ConversationId, participant_id: ParticipantId
+    ) -> None:
+        self._joined(conversation_id).pop(participant_id, None)
+
+    async def list_participants(self, conversation_id: ConversationId) -> list[Participant]:
+        joined = sorted(self._joined(conversation_id).items(), key=lambda item: item[1])
+        return [Participant(id=pid, joined_at=at) for pid, at in joined]
+
+    def _joined(self, conversation_id: ConversationId) -> dict[ParticipantId, datetime]:
+        return self._participants.setdefault(conversation_id, {})
+
+
+class FakeUserDirectory:
+    """In-memory ``UserDirectory`` mapping known email addresses to user ids."""
+
+    def __init__(self, by_email: dict[str, UUID] | None = None) -> None:
+        self._by_email = dict(by_email or {})
+
+    def register(self, email: str, user_id: UUID) -> None:
+        self._by_email[email.strip().lower()] = user_id
+
+    async def find_id_by_email(self, email: str) -> UUID | None:
+        return self._by_email.get(email.strip().lower())
 
 
 class FakeMessageRepository:

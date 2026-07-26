@@ -1,4 +1,4 @@
-"""Unit tests for the Conversation aggregate root — lifecycle and ownership."""
+"""Unit tests for the Conversation aggregate root — lifecycle, ownership, and membership."""
 
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -6,11 +6,14 @@ from uuid import UUID, uuid4
 import pytest
 
 from dizzchat.contexts.messaging.domain.conversation import (
+    CannotRemoveConversationOwner,
     Conversation,
     ConversationId,
     ConversationTitle,
     NotConversationOwner,
+    NotConversationParticipant,
     OwnerId,
+    ParticipantId,
 )
 
 _CREATED_AT = datetime(2024, 1, 1, tzinfo=UTC)
@@ -64,6 +67,60 @@ def test_ensure_owned_by_accepts_the_owner_and_rejects_others() -> None:
 
     with pytest.raises(NotConversationOwner):
         conversation.ensure_owned_by(OwnerId(uuid4()))
+
+
+def test_start_makes_the_owner_the_first_participant() -> None:
+    owner = OwnerId(uuid4())
+    conversation = _conversation(owner=owner)
+
+    assert conversation.participant_ids == frozenset({ParticipantId(owner.value)})
+    conversation.ensure_participant(ParticipantId(owner.value))  # does not raise
+
+
+def test_ensure_participant_accepts_members_and_rejects_everyone_else() -> None:
+    conversation = _conversation()
+    guest = ParticipantId(uuid4())
+
+    with pytest.raises(NotConversationParticipant):
+        conversation.ensure_participant(guest)
+
+    conversation.add_participant(guest)
+    conversation.ensure_participant(guest)  # does not raise
+
+
+def test_add_participant_is_idempotent() -> None:
+    conversation = _conversation()
+    guest = ParticipantId(uuid4())
+
+    assert conversation.add_participant(guest) is True
+    assert conversation.add_participant(guest) is False
+    assert len(conversation.participant_ids) == 2  # owner + one guest, not two guest entries
+
+
+def test_remove_participant_drops_a_member() -> None:
+    owner = OwnerId(uuid4())
+    conversation = _conversation(owner=owner)
+    guest = ParticipantId(uuid4())
+    conversation.add_participant(guest)
+
+    conversation.remove_participant(guest)
+
+    assert conversation.participant_ids == frozenset({ParticipantId(owner.value)})
+
+
+def test_remove_participant_refuses_the_owner() -> None:
+    owner = OwnerId(uuid4())
+    conversation = _conversation(owner=owner)
+
+    with pytest.raises(CannotRemoveConversationOwner):
+        conversation.remove_participant(ParticipantId(owner.value))
+
+
+def test_remove_participant_rejects_someone_who_never_joined() -> None:
+    conversation = _conversation()
+
+    with pytest.raises(NotConversationParticipant):
+        conversation.remove_participant(ParticipantId(uuid4()))
 
 
 def test_conversations_are_equal_by_identity_not_fields() -> None:

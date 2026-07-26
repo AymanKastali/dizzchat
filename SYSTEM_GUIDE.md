@@ -46,6 +46,10 @@ There is **no external LLM call**: the assignment is about getting the backend r
 persistence, real-time delivery, cross-replica fan-out, and delivery guarantees — not about the
 model.
 
+A conversation holds **many participants**. Its owner invites others by email; from then on every
+message any participant sends is broadcast to **all** of them, on whichever replica their sockets
+happen to live.
+
 The system runs as **two identical API replicas** sharing one PostgreSQL database and one Redis
 instance. A message sent to a socket on replica A is delivered to sockets on replica B via **Redis
 pub/sub**. Messages **persist** in Postgres (they survive restarts), are **idempotent** per a
@@ -272,27 +276,33 @@ src/dizzchat/
     messaging/                        conversations + messages + realtime delivery
       domain/
         errors.py                     MessagingError base
-        conversation/conversation.py  Conversation aggregate (start/rename/delete/ensure_owned_by)
-        conversation/value_objects.py ConversationId, OwnerId, ConversationTitle (<=200, trimmed)
+        conversation/conversation.py  Conversation aggregate (lifecycle + ensure_owned_by /
+                                      ensure_participant / add_participant / remove_participant)
+        conversation/value_objects.py ConversationId, OwnerId, ParticipantId, ConversationTitle
+        conversation/participant.py   Participant (read-side VO: id + joined_at)
         conversation/repository.py    ConversationRepository port
-        conversation/errors.py        ConversationNotFound, NotConversationOwner, InvalidConversationTitle
+        conversation/errors.py        ConversationNotFound, NotConversationOwner,
+                                      NotConversationParticipant, ParticipantUserNotFound,
+                                      CannotRemoveConversationOwner, InvalidConversationTitle
         message/message.py            Message aggregate (immutable record, id = seq)
         message/value_objects.py      MessageRole, MessageId, SenderId, ClientMessageId, MessageContent
         message/repository.py         MessageRepository port
         message/errors.py             InvalidMessageContent
       application/
-        ports.py                      ConversationAccess, AssistantResponder, MessageBroadcaster,
-                                      MessageWriter, MessageReplayer
+        ports.py                      ConversationAccess, UserDirectory, AssistantResponder,
+                                      MessageBroadcaster, MessageWriter, MessageReplayer
         dto/message_page.py           MessagePage (items, next_cursor, has_more)
         services/create_conversation.py, list_conversations.py, rename_conversation.py,
                  delete_conversation.py (soft), get_conversation_history.py (cursor paging),
                  ensure_conversation_access.py, post_message.py, message_exchange.py,
-                 replay_messages.py
+                 replay_messages.py,
+                 add_participant.py, list_participants.py, remove_participant.py
       infrastructure/
         inbound/api/router.py         /conversations REST router
         inbound/api/dependencies.py   Conversations DI
         inbound/api/errors.py         messaging error -> HTTP status mapping
-        inbound/api/controllers/      create/list/rename/delete/get_conversation_history
+        inbound/api/controllers/      create/list/rename/delete/get_conversation_history,
+                                      add/list/remove_participant
         inbound/api/schemas/          request/response DTOs
         inbound/api/realtime/router.py       registers WS route /ws/conversations/{id}
         inbound/api/realtime/websocket.py    the WS endpoint handler (the core flow)
@@ -305,7 +315,9 @@ src/dizzchat/
         outbound/redis/message_codec.py       encode/decode a domain Message <-> JSON bytes
         outbound/redis/redis_message_broadcaster.py  RedisMessageBroadcaster (PUBLISH only)
         outbound/redis/redis_conversation_subscriber.py RedisConversationSubscriber (per-replica reader)
-        outbound/persistence/models/          conversation_model, message_model
+        outbound/identity/identity_user_directory.py  email -> user id (anti-corruption layer)
+        outbound/persistence/models/          conversation_model, conversation_participant_model,
+                                              message_model
         outbound/persistence/repositories/    SQLAlchemy conversation + message repos
         outbound/persistence/session_scoped_conversation_access.py   per-call UoW for access check
         outbound/persistence/session_scoped_message_writer.py        per-message UoW writer
@@ -344,8 +356,21 @@ constructed — so an invalid state is unrepresentable past the boundary.
 ### Messaging
 
 - **`Conversation`** (`domain/conversation/conversation.py`) — lifecycle `start` / `rename` /
-  `delete` (soft), plus `ensure_owned_by(owner_id)` (raises `NotConversationOwner`) and
-  `is_deleted`. `delete` is idempotent (sets `deleted_at` + `updated_at`).
+  `delete` (soft) and `is_deleted`, plus **two levels of authorization it enforces itself**:
+  - `ensure_owned_by(owner_id)` (raises `NotConversationOwner`) — administration: rename, delete,
+    and changing the membership.
+  - `ensure_participant(participant_id)` (raises `NotConversationParticipant`) — taking part:
+    joining the live channel, sending, reading history.
+
+  Membership lives on the aggregate as `participant_ids: frozenset[ParticipantId]`, mutated by
+  `add_participant` (idempotent, returns whether it was new) and `remove_participant` (raises
+  `CannotRemoveConversationOwner` for the owner). `start` seeds the owner, so **the owner is always a
+  participant** and can never be locked out of their own conversation. `delete` is idempotent (sets
+  `deleted_at` + `updated_at`).
+- **`Participant`** (`domain/conversation/participant.py`) — a read-side VO pairing a
+  `ParticipantId` with `joined_at`. The aggregate deliberately holds **ids only**: identity is all it
+  needs to decide access, and `joined_at` carries no invariant, so it is served from this projection
+  (`ConversationRepository.list_participants`) rather than loaded into the aggregate.
 - **`Message`** (`domain/message/message.py`) — an **immutable** persisted record and a **separate
   aggregate** from `Conversation`. Its identity is `MessageId`, which is also the ordering key.
 - **VOs** (`domain/message/value_objects.py`):
@@ -356,17 +381,25 @@ constructed — so an invalid state is unrepresentable past the boundary.
   - `MessageContent` — required non-empty (rejects blank/whitespace via `InvalidMessageContent`).
   - `ConversationTitle` — trimmed, ≤ 200 chars.
 
-> **Why `OwnerId` is not Identity's `UserId`.** `messaging` defines its own `OwnerId`
+> **Why `OwnerId`/`ParticipantId` are not Identity's `UserId`.** `messaging` defines its own
 > (`domain/conversation/value_objects.py`) rather than importing `identity.UserId`. This keeps the
 > two bounded contexts **decoupled** — `messaging` doesn't depend on Identity's model; it just
-> stores the owning user's id as its own concept. The value happens to be the same UUID; the type
-> boundary is deliberate.
+> stores the user's id as its own concept. The values happen to be the same UUID; the type boundary
+> is deliberate. `OwnerId` and `ParticipantId` are separate because they name different *roles* in
+> the aggregate, and the code reads better for it: `ensure_owned_by(OwnerId(...))` versus
+> `ensure_participant(ParticipantId(...))` says which rule is being applied.
+>
+> The **one** place Messaging must ask Identity a question is admitting a participant by email. That
+> goes through the `UserDirectory` port (`application/ports.py`), implemented by
+> `IdentityUserDirectory` (`infrastructure/outbound/identity/`), which constructs Identity's `Email`
+> and returns a bare `UUID`. An anti-corruption layer, in infrastructure — where cross-context
+> coupling belongs — so the domain and use cases stay ignorant of Identity entirely.
 
 ---
 
 ## 7. Database schema
 
-Four Alembic migrations, a linear chain, all in `migrations/versions/`. Final schema:
+Five Alembic migrations, a linear chain, all in `migrations/versions/`. Final schema:
 
 ### `users` (0001)
 | Column | Type | Notes |
@@ -394,6 +427,20 @@ Four Alembic migrations, a linear chain, all in `migrations/versions/`. Final sc
 | `created_at` / `updated_at` | DateTime(tz) | |
 | `deleted_at` | DateTime(tz) | nullable — **soft-delete** marker |
 
+### `conversation_participants` (0005)
+| Column | Type | Notes |
+|---|---|---|
+| `conversation_id` | UUID | FK → `conversations.id`; **composite PK** |
+| `user_id` | UUID | **composite PK**, indexed (`ix_conversation_participants_user_id`) |
+| `joined_at` | DateTime(tz) | |
+
+The composite PK on `(conversation_id, user_id)` *is* the uniqueness rule — a user cannot be admitted
+twice, enforced at the database as well as in the aggregate. The `user_id` index backs
+`list_for_participant` ("the conversations I'm in"). The ORM loads the set with
+`relationship(lazy="selectin")`, which is required rather than stylistic: the default lazy loader
+emits I/O on attribute access and raises under asyncio, and `selectin` batches, so listing N
+conversations costs one extra query rather than N.
+
 ### `messages` (0002, extended by 0003 & 0004)
 | Column | Type | Notes |
 |---|---|---|
@@ -413,7 +460,8 @@ Indexes/constraints on `messages`:
   rows (both with `client_message_id = NULL`) never collide.
 
 ### Migration chain
-`0001_identity` → `0002_conversations` → `0003_message_role` → `0004_client_message_id`.
+`0001_identity` → `0002_conversations` → `0003_message_role` → `0004_client_message_id` →
+`0005_conversation_participants`.
 - **0003** adds `role` with a temporary `server_default='user'` to backfill existing rows, then
   drops the default so the app must supply role on every insert; also makes `sender_id` nullable.
 - **0004** adds `client_message_id` + the unique constraint. Building the backing unique index takes
@@ -421,6 +469,11 @@ Indexes/constraints on `messages`:
   migrations run inside a transaction (see the advisory lock below) and `CONCURRENTLY` isn't allowed
   in a transaction. Acceptable on a small table; see [§15](#15-key-decisions--trade-offs) for the
   large-table plan.
+- **0005** creates `conversation_participants` and **backfills the owner of every existing
+  conversation** as its first participant. The backfill is load-bearing, not cosmetic: access is now
+  decided by membership, so a conversation without a row would leave its own owner unable to connect,
+  post, or read history. It has no `WHERE` clause, so soft-deleted conversations are backfilled too
+  and remain restorable.
 
 ### Migrations run on boot, serialized (`migrations/env.py`)
 Every replica runs `alembic upgrade head` during startup. Inside the migration transaction it first
@@ -498,7 +551,7 @@ CLIENT A        REPLICA 1         POSTGRES            REDIS
   │◄────────────────┤                 │                 │   ② accept() → 101 Switching
   ├────────────────►│                 │                 │   ③ auth frame (≤ 5s, else 4401)
   │                 ├────────────────►│                 │   ④ access.ensure() — own session
-  │                 │◄────────────────┤                 │   ⑤ owner confirmed (else 4403)
+  │                 │◄────────────────┤                 │   ⑤ participant? (else 4403)
   │◄────────────────┤                 │                 │   ⑥ auth.ok
   │                 ├─────────────────┼────────────────►│   ⑦ SUBSCRIBE conv:{id}
   │                 │◄────────────────┼─────────────────┤   ⑧ subscribed → join() returns
@@ -551,19 +604,26 @@ is diagram E.
 
 #### E. Fan-out — how the message reaches sockets on both replicas
 
+Alice and Bob are **two different users** who are both participants of this conversation, connected to
+different replicas. Alice sends; both of them receive.
+
 ```
-CLIENT A    REPLICA 1       REDIS       REPLICA 2     CLIENT B
-(socket)   (api :8000)     pub/sub    (api2 :8001)    (socket)
+ALICE       REPLICA 1       REDIS       REPLICA 2        BOB
+(socket)   (api :8000)     pub/sub     (api2 :8001)    (socket)
   │             │             │             │             │
   │             ├────────────►│             │             │   ① PUBLISH conv:{id}
   │             │◄────────────┤             │             │   ② loopback to replica 1
   │             │             ├────────────►│             │   ③ fan-out to replica 2
-  │◄────────────┤             │             │             │   ④ message.new → A
-  │             │             │             ├────────────►│   ⑤ message.new → B
+  │◄────────────┤             │             │             │   ④ message.new → alice
+  │             │             │             ├────────────►│   ⑤ message.new → bob
   │             │             │             │             │   ══ ①–⑤ repeat for the reply
-  │◄────────────┤             │             │             │   ⑥ message.ack → A
+  │◄────────────┤             │             │             │   ⑥ message.ack → alice
 ```
 
+- **This is the whole of multi-user broadcast.** `ConnectionManager` keys sockets by *conversation*,
+  never by user, so ④ and ⑤ are the same code path whether the two sockets belong to one person on two
+  devices or to two different participants. Adding multiple users to a conversation therefore changed
+  only the **authorization** gate at ⑤ in diagram C — not one line of the delivery path here.
 - **The sender gets its own message back through Redis.** Replica 1 is not treated specially: it
   receives its own `PUBLISH` on its own subscription (②) and delivers from there. That leaves exactly
   **one** delivery path to any socket — `subscriber → ConnectionManager.broadcast` — instead of one
@@ -672,22 +732,42 @@ rolls back on error, so use-cases just add to the session and let teardown commi
 
 ### 8.3 Conversations REST (`/conversations`)
 
-All routes require a Bearer token (reuses Identity's `get_current_user`) and operate only on the
-caller's own conversations.
+All routes require a Bearer token (reuses Identity's `get_current_user`). Reads and sends are open to
+any **participant**; rename, delete, and membership changes are **owner-only**.
 
-- **Create → 201** — `Conversation.start(...)` then `conversations.create(...)` (`deleted_at=None`).
-- **List** — `list_for_owner` filters `owner_id = ? AND deleted_at IS NULL`, newest first.
+- **Create → 201** — `Conversation.start(...)` (which seeds the owner as the first participant) then
+  `conversations.create(..., participant_ids=...)`, so the conversation row and its owner membership
+  land in one unit of work.
+- **List** — `list_for_participant` joins `conversation_participants` on `user_id = ?` and filters
+  `deleted_at IS NULL`, newest first. Returns conversations the caller **owns or was invited to**.
 - **Rename** — `get` (→ 404 if absent), `ensure_owned_by` (→ 403), `rename`, `update`.
 - **Delete → 204 (soft)** — `get` (→ 404), `ensure_owned_by`, `delete(now)` sets `deleted_at`,
   `update`. Because `get` already filters `deleted_at IS NULL`, deleting an already-deleted
   conversation returns 404 (idempotent from the client's view).
 - **`GET /{id}/messages` — cursor pagination** — query `before` (int ≥ 1, optional) + `limit`
-  (default 50, 1–100). `GetConversationHistory.execute`: `get` (→ 404), `ensure_owned_by` (→ 403),
+  (default 50, 1–100). `GetConversationHistory.execute`: `get` (→ 404), `ensure_participant` (→ 403),
   then **over-fetch by one** (`list_history(limit=limit+1)`), compute `has_more = fetched > limit`,
   trim to `limit`, `next_cursor = items[-1].id if has_more else None`. Query is **keyset**:
   `WHERE conversation_id = ? [AND id < before] ORDER BY id DESC LIMIT ?` — newest-first, backed by
   `ix_messages_conversation_id_id`. Response: `{items, next_cursor, has_more}`; pass `next_cursor`
   as the next `before`.
+
+**Participants** — the three routes that make a conversation multi-user:
+
+- **`POST /{id}/participants` → 204** — `AddParticipant.execute`: `get` (→ 404),
+  `ensure_owned_by` (→ **403**, only the owner invites), `users.find_id_by_email(email)` via the
+  `UserDirectory` port (`None` → `ParticipantUserNotFound`, **404**), then
+  `conversation.add_participant(...)` and — **only if the membership is new** —
+  `conversations.add_participant(..., joined_at=now)`. Re-inviting an existing participant is a
+  successful no-op, so a retrying client cannot create a duplicate. The composite PK is the backstop
+  if two invites race past the in-aggregate check.
+- **`GET /{id}/participants` → 200** — `ListParticipants.execute`: `get` (→ 404),
+  `ensure_participant` (→ 403), then `list_participants` → `[{user_id, joined_at}]`, oldest first.
+- **`DELETE /{id}/participants/{user_id}` → 204** — `RemoveParticipant.execute`: `get` (→ 404), then
+  one rule covering both kick and leave — permitted if the actor **is the owner** or is removing
+  **themselves**, else `NotConversationOwner` (403). `conversation.remove_participant` then refuses
+  the owner (`CannotRemoveConversationOwner`, **409**) and rejects someone who never joined
+  (`NotConversationParticipant`, 403), so a refusal is distinguishable from a no-op.
 
 ### 8.4 WebSocket lifecycle (`/ws/conversations/{id}`) — the core
 
@@ -701,9 +781,11 @@ forbidden, `1011` internal; drain uses `1001`.
    Timeout / non-JSON → **close 4401**. A plain disconnect before the frame → just return.
 3. **Token decode** — validate the `AuthFrame`, then `tokens.decode_access(token)`. Invalid frame or
    bad/expired token → **close 4401**. The `auth` payload also carries an optional `last_seen_seq`.
-4. **Access check** — `access.ensure(conversation_id, owner_id)` in its own session
-   (`SessionScopedConversationAccess` → `EnsureConversationAccess`). `ConversationNotFound` /
-   `NotConversationOwner` → **close 4403**.
+4. **Access check** — `access.ensure(conversation_id, participant_id)` in its own session
+   (`SessionScopedConversationAccess` → `EnsureConversationAccess` → `ensure_participant`).
+   `ConversationNotFound` / `NotConversationParticipant` → **close 4403**. Any participant passes, not
+   only the owner — this one check is what makes the conversation multi-user. It runs **once**, at
+   connect; see [§11](#11-security-model) for what that means when a membership is revoked.
 5. **`auth.ok`** — build a `Connection` (a lock-wrapped socket) and send `{"type":"auth.ok"}`.
 6. **Join + subscribe (fail-closed)** — `registry.join(conversation, connection)`: under a lock,
    register the socket locally; if it's the **first** socket for this conversation on this replica,
@@ -728,7 +810,8 @@ forbidden, `1011` internal; drain uses `1001`.
    1. `writer.from_user(...)` → `(user_message, created)`. The session-scoped writer opens its own
       session, runs `PostMessage.from_user`, and **commits** — **persist before broadcast**, so a
       rollback can never surface an unstored message.
-   2. `PostMessage.from_user` enforces ownership, then does a **pre-flight** `find_by_client_message_id`:
+   2. `PostMessage.from_user` re-checks **membership** (`ensure_participant`, so a revoked user stops
+      posting at once even on an open socket), then does a **pre-flight** `find_by_client_message_id`:
       if the client id already exists, returns `(existing, False)` — **no new row**.
    3. If `not created` → return early: **no re-broadcast, no second assistant reply** (idempotent).
    4. Else `broadcaster.broadcast(conv, user_message)` → the mock `reply_to(content)` (`"You said:
@@ -846,6 +929,17 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
   URLs/access logs (unlike a query param) and gives a clean rejection close code.
 - **Token re-validated on every send.** `decode_access` runs again per `message.send`; an expired
   token closes the socket (`4401`) — a socket can't outlive its access token.
+- **Two-level authorization on a conversation.** Reading and sending require **membership**
+  (`ensure_participant`); rename, delete, and changing the membership require **ownership**
+  (`ensure_owned_by`). The owner is seeded as a participant and cannot be removed, so ownership always
+  implies access. Membership is re-checked on **every** send (`PostMessage.from_user`), not only at
+  connect, so revoking it stops the user posting immediately.
+- **Known limitation — revocation doesn't close live sockets.** The connect-time check runs once, so a
+  removed participant keeps *receiving* broadcasts until their socket drops; their *sends* are already
+  refused, and a reconnect is closed `4403`. Closing sockets on removal needs a cross-replica
+  revocation event; deliberately not built (see `NOTES.md`).
+- **Invited users are resolved, never asserted.** An invite names an email, which must belong to a
+  registered user (`404` otherwise), so a mistyped identifier cannot become a phantom participant.
 - **Passwords:** argon2id (`Argon2PasswordHasher`), verified with the library's constant-time check;
   failures are swallowed to a boolean. Hashing always runs via `asyncio.to_thread` (off the loop).
 - **Anti-enumeration + timing defense** on login: malformed emails and missing users both yield the
@@ -903,8 +997,12 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 - **Layout mirrors the source.** `tests/` follows `contexts/{identity,messaging}` down through
   `domain/`, `application/`, `infrastructure/{api,security,redis}`, plus root `tests/test_health.py`
   and `tests/test_logging.py`.
-- **Scale.** 130 tests across 30 files. Heaviest: `test_websocket_routes.py` (13),
-  `test_conversation_routes.py` (9), `test_message.py` (8).
+- **Scale.** 165 tests across 33 files. Heaviest: `test_conversation_routes.py` (19),
+  `test_websocket_routes.py` (14), `test_conversation.py` (11).
+- **The multi-user proof.**
+  `test_websocket_routes.py::test_a_message_from_one_user_is_broadcast_to_every_other_user_in_the_conversation`
+  drives **two sockets authenticated as two different users** on one conversation and asserts both
+  receive the `message.new`, while only the sender receives the `message.ack`.
 - **Fakes over infrastructure.** Almost every test uses in-memory fakes (`tests/contexts/*/fakes.py`)
   — fake repositories, hasher, token service, broadcaster, responder, `FixedClock`, etc. — so unit
   tests need no DB or network.
@@ -979,6 +1077,9 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 **Where do I look to answer…**
 - *How does auth work?* → [§8.2](#82-rest-auth-auth), [§11](#11-security-model);
   `contexts/identity/…`.
+- *How do several users end up in one conversation?* → [§8.3](#83-conversations-rest-conversations)
+  for the participant routes, [§6](#6-domain-model) for the aggregate rules,
+  [§11](#11-security-model) for who may do what.
 - *Show me the whole flow in one picture.* → [§8.0](#80-the-whole-flow-in-one-picture) (six diagrams,
   boot → connect → send → fan-out → teardown, each step cited to code).
 - *How does a message travel end to end?* → [§8.0](#80-the-whole-flow-in-one-picture) for the diagrams,

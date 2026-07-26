@@ -13,8 +13,9 @@ from dizzchat.contexts.messaging.domain.conversation import (
     Conversation,
     ConversationId,
     ConversationNotFound,
-    NotConversationOwner,
+    NotConversationParticipant,
     OwnerId,
+    ParticipantId,
 )
 from dizzchat.contexts.messaging.domain.message import MessageContent, MessageRole, SenderId
 from tests.contexts.messaging.fakes import (
@@ -53,7 +54,7 @@ async def test_returns_latest_page_with_more_flag_and_cursor() -> None:
     created = await _seed(conversations, messages, owner, count=5)
 
     page = await GetConversationHistory(conversations, messages).execute(
-        conversation_id=created.id, owner_id=owner, before=None, limit=3
+        conversation_id=created.id, participant_id=ParticipantId(owner.value), before=None, limit=3
     )
 
     # Newest first (ids 5,4,3); older messages remain, so the cursor is the oldest returned (3).
@@ -68,10 +69,18 @@ async def test_second_page_via_before_cursor_returns_older_messages() -> None:
     owner = OwnerId(uuid4())
     created = await _seed(conversations, messages, owner, count=5)
     handler = GetConversationHistory(conversations, messages)
-    first = await handler.execute(conversation_id=created.id, owner_id=owner, before=None, limit=3)
+    first = await handler.execute(
+        conversation_id=created.id,
+        participant_id=ParticipantId(owner.value),
+        before=None,
+        limit=3,
+    )
 
     second = await handler.execute(
-        conversation_id=created.id, owner_id=owner, before=first.next_cursor, limit=3
+        conversation_id=created.id,
+        participant_id=ParticipantId(owner.value),
+        before=first.next_cursor,
+        limit=3,
     )
 
     assert [m.content.value for m in second.items] == ["m1", "m0"]
@@ -84,17 +93,20 @@ async def test_rejects_history_for_a_missing_conversation() -> None:
     with pytest.raises(ConversationNotFound):
         await handler.execute(
             conversation_id=ConversationId(uuid4()),
-            owner_id=OwnerId(uuid4()),
+            participant_id=ParticipantId(uuid4()),
             before=None,
             limit=10,
         )
 
 
-async def test_rejects_history_for_a_conversation_owned_by_another() -> None:
+async def test_rejects_history_for_someone_who_is_not_a_participant() -> None:
     conversations, messages = FakeConversationRepository(), FakeMessageRepository()
     created = await _seed(conversations, messages, OwnerId(uuid4()), count=1)
 
-    with pytest.raises(NotConversationOwner):
+    with pytest.raises(NotConversationParticipant):
         await GetConversationHistory(conversations, messages).execute(
-            conversation_id=created.id, owner_id=OwnerId(uuid4()), before=None, limit=10
+            conversation_id=created.id,
+            participant_id=ParticipantId(uuid4()),
+            before=None,
+            limit=10,
         )
