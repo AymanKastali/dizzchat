@@ -283,17 +283,7 @@ that open one transaction per message rather than reusing a request-scoped sessi
 
 ## Demo
 
-With the stack running (`docker compose up --build`), the whole round-trip — including the
-cross-replica bonus — runs in one command:
-
-```bash
-./demo.sh   # needs curl, jq, and websocat on PATH
-```
-
-It signs up, logs in, creates a conversation, sends a message on replica `:8000`, shows the
-idempotent resend, then reconnects to replica `:8001` and replays the missed messages via Redis.
-
-The same sequence by hand, using `curl` and [`websocat`](https://github.com/vi/websocat):
+A full round-trip using `curl` and [`websocat`](https://github.com/vi/websocat):
 
 ```bash
 # 1. Sign up and log in.
