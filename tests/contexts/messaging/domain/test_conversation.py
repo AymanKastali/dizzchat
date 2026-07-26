@@ -59,6 +59,51 @@ def test_delete_soft_deletes_and_is_idempotent() -> None:
     assert conversation.deleted_at == deleted_at
 
 
+def test_restore_clears_the_deletion_and_bumps_updated_at() -> None:
+    conversation = _conversation()
+    deleted_at = _CREATED_AT + timedelta(hours=1)
+    restored_at = _CREATED_AT + timedelta(hours=2)
+    conversation.delete(deleted_at)
+
+    conversation.restore(restored_at)
+
+    assert conversation.is_deleted is False
+    assert conversation.deleted_at is None
+    assert conversation.updated_at == restored_at
+
+
+def test_restoring_an_active_conversation_changes_nothing() -> None:
+    conversation = _conversation()
+
+    conversation.restore(_CREATED_AT + timedelta(hours=1))
+
+    assert conversation.is_deleted is False
+    assert conversation.updated_at == _CREATED_AT  # not bumped — a no-op, so a retry is harmless
+
+
+def test_a_restored_conversation_can_be_deleted_again() -> None:
+    conversation = _conversation()
+    second_deletion = _CREATED_AT + timedelta(hours=3)
+    conversation.delete(_CREATED_AT + timedelta(hours=1))
+    conversation.restore(_CREATED_AT + timedelta(hours=2))
+
+    conversation.delete(second_deletion)
+
+    assert conversation.deleted_at == second_deletion
+
+
+def test_restore_keeps_the_participants() -> None:
+    owner = OwnerId(uuid4())
+    conversation = _conversation(owner=owner)
+    guest = ParticipantId(uuid4())
+    conversation.add_participant(guest)
+    conversation.delete(_CREATED_AT + timedelta(hours=1))
+
+    conversation.restore(_CREATED_AT + timedelta(hours=2))
+
+    assert conversation.participant_ids == frozenset({ParticipantId(owner.value), guest})
+
+
 def test_ensure_owned_by_accepts_the_owner_and_rejects_others() -> None:
     owner = OwnerId(uuid4())
     conversation = _conversation(owner=owner)

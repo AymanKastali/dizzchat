@@ -144,6 +144,24 @@ the write model. The assignment needs neither cross-context reactions nor an aud
 so an event backbone would be complexity without a paying use case. Revisit if requirements grow a
 real consumer — an activity feed, an audit log, or asynchronous cross-context workflows.
 
+### Restore is idempotent, and reads through one deliberate exception to the soft-delete filter
+Soft-delete is enforced by the repository: `get` and `list_for_participant` filter `deleted_at IS NULL`,
+so no use case can accidentally act on a deleted conversation. Restore breaks that rule by necessity — it
+exists precisely to act on a deleted row — so instead of loosening `get`, the port grew a second, explicitly
+named read: `get_including_deleted`. Exactly one caller uses it (`RestoreConversation`), which makes the
+exception auditable by grep rather than a flag that any future caller might flip.
+
+`restore` is idempotent and mirrors `delete`: each is a no-op in the state it leads to, so restoring an
+active conversation returns `200` and does not touch `updated_at`. The alternative — `409 Conflict` for
+"not deleted" — would make a retried request fail on the retry, which is the wrong answer for an undo
+button. It stays **owner-only** (`ensure_owned_by`), like rename and delete: restoring changes what every
+participant can see, so it's administration, not participation.
+
+Because delete never touched the message or participant rows, restore needs no data repair — clearing
+`deleted_at` brings the history and the membership back exactly as they were. That was the point of
+choosing soft-delete in the first place, and it's why this landed as one endpoint and one repository
+method rather than a recovery process.
+
 ### Modular monolith, not microservices
 One deployable with two bounded contexts kept behind module boundaries (hexagonal layering, ports
 and adapters). This preserves a clean split-point later without paying distributed-systems cost now.
@@ -161,8 +179,9 @@ knowingly, and each line is the real consequence rather than a reassurance:
   Fine at assignment scale, an availability problem at real scale. (Remedy below.)
 - **Per-user rate limiting.** An authenticated client can send as fast as it likes; the only gate on the
   send path is token validity. This is the most obvious production gap.
-- **Conversation restore.** Delete is a soft-delete, but with no restore endpoint a deleted conversation is
-  unreachable without direct DB access — so the `deleted_at` column currently buys auditability, not undo.
+- **Retention and an audit trail for delete/restore.** Restore is built (see the decision below), but a
+  soft-deleted conversation stays restorable forever — nothing purges it — and no record says who deleted or
+  restored it. `deleted_at` is a state flag, not a history.
 - **Streamed assistant replies and typing/presence indicators.** The mock returns one whole `message.new`.
   Streaming would need chunk framing and a terminal marker; presence would need cross-replica state, which
   nothing in the system tracks today.

@@ -19,6 +19,7 @@ from dizzchat.contexts.messaging.application.services import (
     ListParticipants,
     RemoveParticipant,
     RenameConversation,
+    RestoreConversation,
 )
 from dizzchat.contexts.messaging.infrastructure.outbound.identity import IdentityUserDirectory
 from dizzchat.contexts.messaging.infrastructure.outbound.persistence import (
@@ -42,6 +43,10 @@ def provide_rename_conversation(session: SessionDep, clock: ClockDep) -> RenameC
 
 def provide_delete_conversation(session: SessionDep, clock: ClockDep) -> DeleteConversation:
     return DeleteConversation(SqlAlchemyConversationRepository(session), clock)
+
+
+def provide_restore_conversation(session: SessionDep, clock: ClockDep) -> RestoreConversation:
+    return RestoreConversation(SqlAlchemyConversationRepository(session), clock)
 
 
 def provide_get_conversation_history(session: SessionDep) -> GetConversationHistory:
@@ -69,6 +74,7 @@ CreateConversationDep = Annotated[CreateConversation, Depends(provide_create_con
 ListConversationsDep = Annotated[ListConversations, Depends(provide_list_conversations)]
 RenameConversationDep = Annotated[RenameConversation, Depends(provide_rename_conversation)]
 DeleteConversationDep = Annotated[DeleteConversation, Depends(provide_delete_conversation)]
+RestoreConversationDep = Annotated[RestoreConversation, Depends(provide_restore_conversation)]
 GetConversationHistoryDep = Annotated[
     GetConversationHistory, Depends(provide_get_conversation_history)
 ]

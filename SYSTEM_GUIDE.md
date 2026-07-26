@@ -293,7 +293,8 @@ src/dizzchat/
                                       MessageBroadcaster, MessageWriter, MessageReplayer
         dto/message_page.py           MessagePage (items, next_cursor, has_more)
         services/create_conversation.py, list_conversations.py, rename_conversation.py,
-                 delete_conversation.py (soft), get_conversation_history.py (cursor paging),
+                 delete_conversation.py (soft), restore_conversation.py (undelete),
+                 get_conversation_history.py (cursor paging),
                  ensure_conversation_access.py, post_message.py, message_exchange.py,
                  replay_messages.py,
                  add_participant.py, list_participants.py, remove_participant.py
@@ -301,7 +302,8 @@ src/dizzchat/
         inbound/api/router.py         /conversations REST router
         inbound/api/dependencies.py   Conversations DI
         inbound/api/errors.py         messaging error -> HTTP status mapping
-        inbound/api/controllers/      create/list/rename/delete/get_conversation_history,
+        inbound/api/controllers/      create/list/rename/delete/restore,
+                                      get_conversation_history,
                                       add/list/remove_participant
         inbound/api/schemas/          request/response DTOs
         inbound/api/realtime/router.py       registers WS route /ws/conversations/{id}
@@ -358,15 +360,16 @@ constructed — so an invalid state is unrepresentable past the boundary.
 - **`Conversation`** (`domain/conversation/conversation.py`) — lifecycle `start` / `rename` /
   `delete` (soft) and `is_deleted`, plus **two levels of authorization it enforces itself**:
   - `ensure_owned_by(owner_id)` (raises `NotConversationOwner`) — administration: rename, delete,
-    and changing the membership.
+    restore, and changing the membership.
   - `ensure_participant(participant_id)` (raises `NotConversationParticipant`) — taking part:
     joining the live channel, sending, reading history.
 
   Membership lives on the aggregate as `participant_ids: frozenset[ParticipantId]`, mutated by
   `add_participant` (idempotent, returns whether it was new) and `remove_participant` (raises
   `CannotRemoveConversationOwner` for the owner). `start` seeds the owner, so **the owner is always a
-  participant** and can never be locked out of their own conversation. `delete` is idempotent (sets
-  `deleted_at` + `updated_at`).
+  participant** and can never be locked out of their own conversation. `delete` (sets `deleted_at` +
+  `updated_at`) and `restore` (clears `deleted_at`, bumps `updated_at`) are both idempotent — each is
+  a no-op in the state it leads to, so neither can be corrupted by a retry.
 - **`Participant`** (`domain/conversation/participant.py`) — a read-side VO pairing a
   `ParticipantId` with `joined_at`. The aggregate deliberately holds **ids only**: identity is all it
   needs to decide access, and `joined_at` carries no invariant, so it is served from this projection
@@ -425,7 +428,7 @@ Five Alembic migrations, a linear chain, all in `migrations/versions/`. Final sc
 | `owner_id` | UUID | indexed (`ix_conversations_owner_id`) |
 | `title` | String(200) | |
 | `created_at` / `updated_at` | DateTime(tz) | |
-| `deleted_at` | DateTime(tz) | nullable — **soft-delete** marker |
+| `deleted_at` | DateTime(tz) | nullable — **soft-delete** marker; clearing it is restore |
 
 ### `conversation_participants` (0005)
 | Column | Type | Notes |
@@ -733,7 +736,7 @@ rolls back on error, so use-cases just add to the session and let teardown commi
 ### 8.3 Conversations REST (`/conversations`)
 
 All routes require a Bearer token (reuses Identity's `get_current_user`). Reads and sends are open to
-any **participant**; rename, delete, and membership changes are **owner-only**.
+any **participant**; rename, delete, restore, and membership changes are **owner-only**.
 
 - **Create → 201** — `Conversation.start(...)` (which seeds the owner as the first participant) then
   `conversations.create(..., participant_ids=...)`, so the conversation row and its owner membership
@@ -744,6 +747,15 @@ any **participant**; rename, delete, and membership changes are **owner-only**.
 - **Delete → 204 (soft)** — `get` (→ 404), `ensure_owned_by`, `delete(now)` sets `deleted_at`,
   `update`. Because `get` already filters `deleted_at IS NULL`, deleting an already-deleted
   conversation returns 404 (idempotent from the client's view).
+- **`POST /{id}/restore` → 200 `ConversationResponse`** — the inverse. `RestoreConversation.execute`
+  is the **only** caller of `get_including_deleted`, the one repository read without the
+  `deleted_at IS NULL` filter — every other read must keep a deleted conversation invisible, so the
+  exception is a separate, explicitly named method rather than a flag on `get`. Then
+  `ensure_owned_by` (→ 403), `restore(now)`, `update`. `404` only if the id never existed. Restoring
+  an **active** conversation returns 200 and changes nothing, including `updated_at`, so a retried
+  undo is safe — the alternative (`409` for "not deleted") would fail the retry. Delete never touched
+  the message or `conversation_participants` rows, so clearing `deleted_at` brings the full history
+  and membership back with no data repair.
 - **`GET /{id}/messages` — cursor pagination** — query `before` (int ≥ 1, optional) + `limit`
   (default 50, 1–100). `GetConversationHistory.execute`: `get` (→ 404), `ensure_participant` (→ 403),
   then **over-fetch by one** (`list_history(limit=limit+1)`), compute `has_more = fetched > limit`,
@@ -930,7 +942,7 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 - **Token re-validated on every send.** `decode_access` runs again per `message.send`; an expired
   token closes the socket (`4401`) — a socket can't outlive its access token.
 - **Two-level authorization on a conversation.** Reading and sending require **membership**
-  (`ensure_participant`); rename, delete, and changing the membership require **ownership**
+  (`ensure_participant`); rename, delete, restore, and changing the membership require **ownership**
   (`ensure_owned_by`). The owner is seeded as a participant and cannot be removed, so ownership always
   implies access. Membership is re-checked on **every** send (`PostMessage.from_user`), not only at
   connect, so revoking it stops the user posting immediately.
@@ -997,8 +1009,8 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 - **Layout mirrors the source.** `tests/` follows `contexts/{identity,messaging}` down through
   `domain/`, `application/`, `infrastructure/{api,security,redis}`, plus root `tests/test_health.py`
   and `tests/test_logging.py`.
-- **Scale.** 165 tests across 33 files. Heaviest: `test_conversation_routes.py` (19),
-  `test_websocket_routes.py` (14), `test_conversation.py` (11).
+- **Scale.** 179 tests across 34 files. Heaviest: `test_conversation_routes.py` (24),
+  `test_websocket_routes.py` (15), `test_conversation.py` (15).
 - **The multi-user proof.**
   `test_websocket_routes.py::test_a_message_from_one_user_is_broadcast_to_every_other_user_in_the_conversation`
   drives **two sockets authenticated as two different users** on one conversation and asserts both
@@ -1036,6 +1048,11 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
   persistence models and Pydantic API DTOs.
 - **First-message WS auth over a token query param.** Keeps tokens out of logs; the query-param
   approach is only a documented fallback.
+- **One named exception to the soft-delete filter, not a flag on `get`.** Restore needs to read a
+  deleted row; every other use case must not. So the port grew `get_including_deleted` with exactly
+  one caller (`RestoreConversation`) — an exception you can find by grep, rather than a boolean any
+  future caller could flip. Restore is idempotent for the same reason `delete` is: an undo that
+  fails on retry is the wrong shape.
 
 **Deferred (production-hardening follow-ups, from `NOTES.md`):**
 - **Server-side exactly-once at the replay/live seam** — buffer live frames during replay and
@@ -1084,6 +1101,8 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
   boot → connect → send → fan-out → teardown, each step cited to code).
 - *How does a message travel end to end?* → [§8.0](#80-the-whole-flow-in-one-picture) for the diagrams,
   then [§8.4](#84-websocket-lifecycle-wsconversationsid--the-core)–[§8.5](#85-redis-fan-out) for the prose.
+- *How do delete and restore work?* → [§8.3](#83-conversations-rest-conversations) for both routes,
+  [§6](#6-domain-model) for the idempotency rule, [§7](#7-database-schema) for `deleted_at`.
 - *What's the wire format?* → [§9](#9-real-time-protocol-reference); `realtime/protocol.py`.
 - *What are the delivery guarantees?* → [§10](#10-delivery-guarantees).
 - *What's in the database?* → [§7](#7-database-schema); `migrations/versions/`.

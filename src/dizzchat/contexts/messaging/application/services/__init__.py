@@ -14,6 +14,7 @@ from .post_message import PostMessage
 from .remove_participant import RemoveParticipant
 from .rename_conversation import RenameConversation
 from .replay_messages import ReplayMessages
+from .restore_conversation import RestoreConversation
 
 __all__ = [
     "AddParticipant",
@@ -28,4 +29,5 @@ __all__ = [
     "RemoveParticipant",
     "RenameConversation",
     "ReplayMessages",
+    "RestoreConversation",
 ]

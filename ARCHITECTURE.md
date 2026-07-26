@@ -11,8 +11,8 @@ WebSockets. Messages persist in Postgres, and delivery fans out across **2+ app 
 pub/sub. The "AI" is a mock that echoes a canned assistant reply — the backend is the focus, not the
 model.
 
-**Scope:** all core requirements + the highest-signal nice-to-haves (cursor pagination, soft-delete,
-graceful shutdown, cross-instance fan-out test) + **one** bonus: **message delivery guarantees**
+**Scope:** all core requirements + the highest-signal nice-to-haves (cursor pagination,
+soft-delete + restore, graceful shutdown, cross-instance fan-out test) + **one** bonus: **message delivery guarantees**
 (client-`message_id` dedupe + at-least-once redelivery on reconnect). A conversation holds **many
 participants**, so a message from any of them is broadcast to all of them, on any replica.
 
@@ -133,7 +133,8 @@ domain.
 
 ### Data model (Alembic-managed)
 - `users` (id, email unique, password_hash, created_at)
-- `conversations` (id, owner_id, title, created_at, updated_at, deleted_at nullable → soft-delete)
+- `conversations` (id, owner_id, title, created_at, updated_at, deleted_at nullable → soft-delete;
+  clearing it is restore, so no data is moved either way)
 - `conversation_participants` (conversation_id, user_id, joined_at; composite PK on
   `(conversation_id, user_id)` so a user cannot be admitted twice; indexed on `user_id` for
   "conversations I'm in")
@@ -145,7 +146,8 @@ domain.
 ### Access control — two levels, one aggregate
 `conversations.owner_id` names the administrator; `conversation_participants` names who may take part.
 `Conversation` enforces both itself: `ensure_participant` gates joining the live channel, sending,
-and reading history, while `ensure_owned_by` gates rename, delete, and membership changes. The owner
+and reading history, while `ensure_owned_by` gates rename, delete, restore, and membership changes.
+The owner
 is seeded as a participant by `Conversation.start` and cannot be removed, so a conversation can never
 end up with an owner locked out of it. Membership is re-checked on **every** send, not only at
 connect, so revoking it stops a user posting immediately.
@@ -176,8 +178,8 @@ The system was built in seven slices, each independently testable and each leavi
 2. **Identity.** User model + migration, argon2 hashing, signup/login REST, JWT access+refresh
    issue/validate/refresh, auth dependency. Tests: signup→login→validate; password never plaintext.
 3. **Conversations.** Conversation + Message models + migration, repositories, REST
-   create/list/rename/delete (+ soft-delete), cursor-paginated history. Tests: CRUD + pagination +
-   persistence survives restart.
+   create/list/rename/delete (+ soft-delete/restore), cursor-paginated history. Tests: CRUD +
+   pagination + persistence survives restart.
 4. **Realtime core.** WS endpoint per conversation, first-message auth (+ `4401` close),
    `ConnectionManager`, JSON protocol, persist→broadcast→mock-reply→broadcast, per-socket error
    handling, disconnect/dead-socket cleanup. Tests: send→persist→broadcast; auth rejection;

@@ -70,8 +70,14 @@ class FakeConversationRepository:
         stored.deleted_at = deleted_at
 
     async def get(self, conversation_id: ConversationId) -> Conversation | None:
-        stored = self._by_id.get(conversation_id)
+        stored = await self.get_including_deleted(conversation_id)
         if stored is None or stored.is_deleted:
+            return None
+        return stored
+
+    async def get_including_deleted(self, conversation_id: ConversationId) -> Conversation | None:
+        stored = self._by_id.get(conversation_id)
+        if stored is None:
             return None
         return replace(stored, participant_ids=frozenset(self._joined(conversation_id)))
 
