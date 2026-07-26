@@ -1,284 +1,82 @@
-# Notes — decisions & deferred work
-
-The decisions behind the real-time layer, the one requirement I read as ambiguous, an honest account of
-what I cut, and the follow-ups a production hardening pass would pick up. Nothing here is a known bug.
+# Notes
 
 ## How it's structured
 
-A DDD hexagonal modular monolith: one deployable run as two replicas, split into two bounded contexts —
+A hexagonal modular monolith: one deployable run as two replicas, split into two bounded contexts —
 `identity` (users, JWT, argon2) and `messaging` (conversations, participants, messages, **and** the
-real-time delivery layer) — plus a `shared/` kernel for clock, DB session factory, migration runner,
-Redis client, and `/health`. Each context repeats the same
-`domain / application / infrastructure(inbound|outbound)` shape, and the dependency arrow points
-inward: the domain imports no framework, and infrastructure depends on the core by implementing the
-ports the core declares.
+real-time delivery layer) — plus a `shared/` kernel for the clock, session factory, migrations, Redis
+client, and `/health`. Each context repeats `domain / application / infrastructure(inbound|outbound)`,
+and the arrow points inward: the domain imports no framework, and infrastructure implements its ports.
 
-Real-time lives *inside* `messaging` rather than in a third context, because delivery is *how* messages
-reach clients, not a separate domain — it shares the `Conversation`/`Message` aggregates, so splitting it
-out would have put an artificial boundary through one model.
+Real-time lives *inside* `messaging` rather than in a third context, because delivery is *how*
+messages reach clients, not a separate domain — it shares the `Conversation`/`Message` aggregates, so
+splitting it out would put an artificial boundary through one model. The replicas are interchangeable
+and hold no state of their own: Postgres is the source of truth, Redis pub/sub is fan-out only.
+Annotated file tree in [SYSTEM_GUIDE.md § 2](./SYSTEM_GUIDE.md#2-architecture--codebase-map); ruled-out
+alternatives in [ARCHITECTURE.md](./ARCHITECTURE.md).
 
-Annotated file tree in [SYSTEM_GUIDE.md § 5](./SYSTEM_GUIDE.md#5-codebase-map); the reasoning and the
-alternatives that were ruled out are in [ARCHITECTURE.md](./ARCHITECTURE.md).
+## WebSocket auth
 
-## WebSocket auth — why first-message auth
+The token can travel as a query param, a subprotocol header, or an auth frame. **I chose the
+first-message `auth` frame:**
 
-The assignment allows a query param, a subprotocol header, or an auth frame as the first message. **I
-chose the first-message `auth` frame.**
+- It never puts the token in a URL, so it can't leak into access logs, proxy logs, or history.
+- Rejection is an *application* close code (`4401`) that says what went wrong; a handshake rejection
+  is only an HTTP status the client often can't inspect.
+- It behaves identically on every client, with no reliance on how a given implementation exposes
+  headers or subprotocols.
+- It gives `last_seen_seq` a home next to the token, making reconnect replay one round-trip.
 
-- The token never appears in a URL, so it can't leak into access logs, proxy logs, referrers, or browser
-  history.
-- Rejection is a clean *application* close code (`4401`) that says exactly what went wrong. A handshake
-  rejection can only be an HTTP status the client often can't inspect.
-- It behaves identically across every client — no reliance on how a particular WebSocket implementation
-  exposes headers or subprotocols.
-- It gives `last_seen_seq` a natural home next to the token, which is what makes reconnect replay a
-  single round-trip instead of a follow-up request.
+**Rejected — query param** (`?token=…`): simplest, but the token lands in access and proxy logs and in
+browser history. Kept only as a documented fallback for a client that can't send a first frame.
+**Rejected — `Sec-WebSocket-Protocol`**: keeps the token out of the URL, but that argument exists for
+protocol *negotiation*, not credentials, so some proxies normalise it away — and rejection is again a
+bare handshake failure.
 
-**Rejected — query param** (`?token=…`): simplest to implement, but the token lands in access and proxy
-logs and in browser history. Kept only as a documented fallback if a client genuinely can't send a first
-frame.
+**The cost, stated plainly:** the socket is `accept()`ed *before* it is authenticated. That window is
+bounded by `WS_AUTH_TIMEOUT_SECONDS` (default 5s), then the server closes `4401`. `accept()` must come
+first because a close *code* can't be sent on a connection that was never accepted. The token is then
+re-decoded on **every** `message.send`, so a socket never outlives its credential.
 
-**Rejected — `Sec-WebSocket-Protocol` subprotocol:** keeps the token out of the URL, but the browser
-`WebSocket` constructor's protocol argument exists for *protocol negotiation*, not credentials, so
-smuggling a token through it is a misuse that some proxies and servers normalise away. Rejection is again
-only a handshake failure, with no application close code.
+## Message protocol
 
-**The cost, stated plainly:** the socket is accepted *before* it is authenticated, so an unauthenticated
-socket exists for a moment. It's bounded by `WS_AUTH_TIMEOUT_SECONDS` (default 5s), after which the server
-closes `4401`. `accept()` has to come first because a close *code* can't be sent on a connection that was
-never accepted — the alternative is rejecting the handshake, which loses the diagnosable code.
+- **One envelope.** `{"type": …, "payload": {…}}` for data, `{"type": "error", "error": "<detail>"}`
+  for failures — one shape to parse, and a type field a client can switch on.
+- **Only two inbound types**, `auth` and `message.send`. Every other client need is a REST call or was
+  cut, so the inbound surface stays small enough to validate exhaustively with Pydantic.
+- **History over REST, not a socket frame.** Paginated reads are request/response by nature; on the
+  socket they'd need request/response correlation inside a protocol that otherwise only pushes.
+  Reconnect catch-up needs no round-trip either — `last_seen_seq` triggers replay directly.
+- **Auth failure is a close code, not an `auth.error` frame.** A connection that cannot authenticate
+  should not stay open, so no state exists in which that frame would help: `4401` for the token,
+  `4403` for a conversation the caller is not a *participant* of.
+- **`message.new` and `message.ack` are separate.** `message.new` is the broadcast every subscriber
+  gets; `message.ack` confirms *your* send and echoes `client_message_id` with the server-assigned
+  `id`, so clients needn't tell "mine came back" from "someone else's arrived" by the sender.
+- **The bigserial `id` *is* the sequence number** — one value for identity and order.
 
-## Message protocol decisions
+Frame-by-frame reference in [README.md § API surface](./README.md#api-surface).
 
-**Envelope.** `{"type": ..., "payload": {...}}` for data, `{"type": "error", "error": "<detail>"}` for
-failures — one shape to parse, and a type field a client can switch on.
+## What I'd do next
 
-**Only two inbound types**, `auth` and `message.send`. Every other client need is either a REST call or
-was cut, so the socket's inbound surface stays small enough to validate exhaustively with Pydantic.
+1. **Bound the replay** — cap it and fall back to the paginated REST history endpoint, so one
+   reconnect can't monopolize a socket.
+2. **Streamed assistant reply** — token chunks over the socket.
+3. **Typing indicators / presence.**
+4. **`/metrics`**, with active-connection and message-throughput counters.
+5. **OAuth login**, alongside email/password.
+6. **Load-test proof** of fan-out across the two replicas, with numbers.
 
-**History over REST, not a socket frame.** Paginated reads are request/response by nature: they're
-cacheable, they page cleanly with a cursor, and they're testable with plain HTTP. Putting them on the
-socket would mean inventing request/response correlation (request ids, matching replies) inside a
-protocol that otherwise only pushes. So `GET /conversations/{id}/messages` serves history, and the socket
-stays a pure live channel. Reconnect catch-up doesn't need a `history.request` round-trip either — the
-`auth` frame's `last_seen_seq` triggers replay directly.
+## What I cut — an honest read
 
-**Auth failure is a close code, not an `auth.error` frame.** A connection that cannot authenticate should
-not stay open, so there's no state in which an `auth.error` frame would be useful. `4401` (and `4403` for
-a conversation the caller doesn't own) is unambiguous to any client.
+I took one bonus, delivery guarantees. Each line below is the real consequence, not a reassurance.
 
-**`message.new` and `message.ack` are separate.** `message.new` is the broadcast every subscriber gets;
-`message.ack` confirms *your* send and echoes `client_message_id` with the server-assigned `id`. Merging
-them would force clients to distinguish "my message came back" from "someone else's arrived" by inspecting
-the sender.
-
-**The bigserial `id` *is* the sequence number.** No separate `seq` field on the wire: one value is both
-identity and order, so a client can't mismatch them.
-
-**No `typing`/presence frames.** A nice-to-have, cut — see below.
-
-## Multi-user conversations — the reading I changed my mind about
-
-The brief says users "**join conversations**" and that messages reach "all connected **clients** of a
-conversation". That reads two ways: several clients of *one* user (their phone, laptop, two tabs), or
-several *users* sharing a room. The four mandated sections say nothing either way — conversation REST
-is "create, list, rename, delete", with no invite or share endpoint.
-
-**I first built the single-user reading, then built the second.** Conversations now have a
-participant set: any participant may open a socket, send, and read history, while rename, delete, and
-the membership itself stay with the owner (who is a participant from creation and cannot be removed).
-
-What this cost is worth recording, because it is *less* than it looks: **the delivery path did not
-change at all.** `ConnectionManager` already keyed sockets by conversation rather than by user, and
-the Redis subscriber already re-broadcast to every replica's local sockets, so "all connected clients"
-was never single-user in the transport. The only thing standing in the way was the authorization
-gate — `ensure_owned_by` on connect, send, and history. That is now `ensure_participant`, plus one
-join table (`conversation_participants`, migration 0005) and three endpoints.
-
-**Membership is granted by the owner, by email** (`POST /conversations/{id}/participants`). Two
-alternatives were rejected:
-
-- **Self-service join** (`POST /conversations/{id}/join`, anyone with the id) — much less code, but
-  authorization degrades to "knows the UUID", which is a capability URL, not access control. That
-  sits badly against the brief's "no unauthenticated WebSocket access" constraint.
-- **Invite by user id** — no cross-context lookup needed, but nothing validates the user exists, so a
-  mistyped UUID becomes a silent phantom participant that can never connect.
-
-Resolving the email needs Messaging to ask Identity about a user it does not own. That goes through a
-`UserDirectory` port whose only implementation, `IdentityUserDirectory`, lives in
-`messaging/infrastructure/outbound/identity/`. It constructs Identity's `Email` and returns a bare
-`UUID`, so Identity's types never reach Messaging's domain or use cases — an anti-corruption layer,
-placed in infrastructure precisely because that is where cross-context coupling belongs.
-
-**The assistant still replies to every user message.** `MessageExchange` is untouched, so in a
-three-person room the mock answers all three. That matches the brief's AI-chat framing and kept the
-send path and its tests stable, but it is the wrong behaviour for real group chat; gating on an `@ai`
-mention is the small next step.
-
-**The honest gap: a removed participant keeps *receiving* until they disconnect.** Access is checked
-once, at connect, so revoking a membership does not close a socket that is already open. Their
-*sends* stop at once — `PostMessage` re-checks membership on every message, deliberately — and a
-reconnect is refused with `4403`. Closing live sockets on removal would need a cross-replica
-revocation event (a `participant.removed` publish that each replica turns into a close), which is
-real complexity for a case the assignment never raises. Not built, named here instead.
-
-## An ambiguity I read differently
-
-Requirement 2 says "a client can fetch message history (paginated) **on join**". That reads two ways:
-history *pushed over the socket* at join time, or history *available to fetch* once a client joins.
-
-**I built the second.** A join that automatically pushes an unbounded page of history couples two
-concerns — live delivery and bulk read — onto one channel, and it means every reconnect re-sends data the
-client may already hold. Instead a fresh client loads history over REST and a *reconnecting* client sends
-`last_seen_seq` to get only what it missed. That covers the intent — no client can join and be unable to
-see history — while keeping bulk reads off the live path.
-
-If the intent really was a push-on-join `history` frame, it's a small addition: the replay machinery
-already exists and would just need a `last_seen_seq: 0` default at join.
-
-## Deliberate decisions
-
-### No domain events / CQRS / event sourcing
-The two contexts coordinate through direct use-case calls, not a domain-event bus, and reads share
-the write model. The assignment needs neither cross-context reactions nor an audit/history rebuild,
-so an event backbone would be complexity without a paying use case. Revisit if requirements grow a
-real consumer — an activity feed, an audit log, or asynchronous cross-context workflows.
-
-### Restore is idempotent, and reads through one deliberate exception to the soft-delete filter
-Soft-delete is enforced by the repository: `get` and `list_for_participant` filter `deleted_at IS NULL`,
-so no use case can accidentally act on a deleted conversation. Restore breaks that rule by necessity — it
-exists precisely to act on a deleted row — so instead of loosening `get`, the port grew a second, explicitly
-named read: `get_including_deleted`. Exactly one caller uses it (`RestoreConversation`), which makes the
-exception auditable by grep rather than a flag that any future caller might flip.
-
-`restore` is idempotent and mirrors `delete`: each is a no-op in the state it leads to, so restoring an
-active conversation returns `200` and does not touch `updated_at`. The alternative — `409 Conflict` for
-"not deleted" — would make a retried request fail on the retry, which is the wrong answer for an undo
-button. It stays **owner-only** (`ensure_owned_by`), like rename and delete: restoring changes what every
-participant can see, so it's administration, not participation.
-
-Because delete never touched the message or participant rows, restore needs no data repair — clearing
-`deleted_at` brings the history and the membership back exactly as they were. That was the point of
-choosing soft-delete in the first place, and it's why this landed as one endpoint and one repository
-method rather than a recovery process.
-
-### Rate limiting lives on the transport, counts every frame, and fails open
-The counter is a Redis fixed-window `INCR` keyed `ratelimit:ws:{user_id}:{window}`. Four choices, each with
-the alternative I rejected:
-
-**Per user, in Redis — not per socket, in the process.** A per-process counter would let a client double its
-allowance by opening a second socket, or reset it entirely by reconnecting to the other replica. Keying on the
-user in the Redis both replicas already share makes the quota mean what it says. This is also why the adapter
-has an integration test against a real Redis with *two* limiter instances: fakes cannot prove a shared counter.
-
-**Checked in `_receive_loop`, not inside `MessageExchange`.** The limit protects the transport — how fast a
-socket may be written to — not a business rule, so it sits with the ports declared beside their consumer
-(`realtime/rate_limit.py`, mirroring `ConversationSubscriber`) rather than in `application/ports.py`. Putting
-it in the use case was the alternative, and it fails the requirement below: malformed frames never reach a use
-case, so they could not be counted.
-
-**Every inbound frame counts, including unparseable ones.** A client that floods the socket with garbage costs
-the server real work (a JSON parse attempt and a reply per frame); counting only valid `message.send` frames
-would leave that free. The cost is that a buggy client burns quota on frames it never intended as messages.
-
-**Over-limit is an `error` frame, not a close code.** The socket stays open, consistent with every other
-recoverable failure here (bad JSON, invalid frame, DB error). Closing with a `4429` was the alternative and is
-harsher than the offence: a brief burst from a legitimate client would cost it the connection and force a
-reconnect plus replay. The client can't currently tell *when* to retry — the `error` envelope carries only a
-string, and adding `retry_after_seconds` was left out as unneeded for this protocol.
-
-**Fail open when Redis is unreachable**, with a logged warning. A rate limit is a protection, not an
-authorization rule; silencing a legitimate client because of an infrastructure hiccup is the worse failure.
-Mostly theoretical here — `registry.join` already fails *closed* (`1011`) if Redis is down, so a socket can't
-reach the receive loop without it — but the limiter shouldn't be the thing that decides that.
-
-The accepted flaw is the fixed window: a client that spends its quota at the end of one window and the next
-window's immediately can send `2 * limit` back to back. A sliding window (a sorted set trimmed per call) is
-exact but costs extra round trips and per-request cleanup for precision that a 20-per-10s limit doesn't need.
-
-### Modular monolith, not microservices
-One deployable with two bounded contexts kept behind module boundaries (hexagonal layering, ports
-and adapters). This preserves a clean split-point later without paying distributed-systems cost now.
-
-## What I cut, and the honest cost
-
-I took **one** bonus, as instructed — message delivery guarantees. Everything below was skipped
-knowingly, and each line is the real consequence rather than a reassurance:
-
-- **Ordered exactly-once delivery.** Replay is at-least-once and *unordered at the seam*, so a client
-  tracking a high-water mark instead of a seen-set will drop replayed messages, and one that doesn't dedupe
-  will render duplicates. This is the sharpest edge in the build — it pushes real work onto the client.
-  (Remedy below.)
-- **Bounded replay.** A client away for a long time can trigger an arbitrarily large replay on one socket.
-  Fine at assignment scale, an availability problem at real scale. (Remedy below.)
-- **A fixed rate-limit window, and only on the socket.** Rate limiting *is* built (see the decision below),
-  but a fixed window lets a client send up to 2× the limit across a boundary, and the REST endpoints have no
-  equivalent gate — `/auth/login` in particular is unthrottled, so nothing slows a password-guessing loop.
-- **Retention and an audit trail for delete/restore.** Restore is built (see the decision below), but a
-  soft-deleted conversation stays restorable forever — nothing purges it — and no record says who deleted or
-  restored it. `deleted_at` is a state flag, not a history.
-- **Streamed assistant replies and typing/presence indicators.** The two Req-3 nice-to-haves not taken. The
-  mock returns one whole `message.new`; streaming would need chunk framing, a terminal marker, and an answer
-  for what replay sends (the finished message, never chunks). Presence would need cross-replica ephemeral
-  state — TTL heartbeats plus reconciliation when a replica dies holding sockets — which nothing tracks today.
-- **`/metrics`, OAuth login, load-test numbers.** The other three bonuses, untaken — only one was allowed.
-- **REST correlation ids.** Every WebSocket connection tags its logs with a `connection_id`; REST requests
-  have no equivalent, so an HTTP-side investigation has less to grep on.
-- **A replica dying drops its sockets.** There is no server-side session migration; clients reconnect (to
-  either replica) and catch up with `last_seen_seq`. Redis pub/sub is also fire-and-forget, so a message
-  published while Redis is down is committed to Postgres but never fanned out live — recovery is again
-  reconnect + replay. This is why Postgres, not Redis, is the source of truth.
-
-## Delivery-guarantee follow-ups (from the delivery-guarantees slice)
-
-### Server-side exactly-once at the replay/live seam
-Reconnect replay is **at-least-once and unordered at the seam**: because the socket joins live
-delivery before replay runs (so no message is missed), a live frame can arrive ahead of a lower-`seq`
-replay frame. The current contract pushes dedup/ordering to the client (apply each `seq` once via a
-seen-set; order by the `id` each frame carries). A stricter server-side option would buffer live
-frames during replay and release them in `seq` order for a true exactly-once, ordered stream — more
-server state and back-pressure to manage, deferred until a client can't dedupe.
-
-### Bounded replay for large backlogs
-`_replay_missed` currently streams the full `seq > last_seen_seq` tail. A client that has been away a
-long time could trigger a large replay. Production would cap this — page it with a deadline and fall
-back to "catch up via the REST history endpoint" past a threshold — so a single reconnect can't
-monopolize a socket.
-
-### `CREATE UNIQUE INDEX CONCURRENTLY` for the dedupe constraint
-Migration 0004 adds `uq_messages_conversation_id_client_message_id`. Building it takes an
-`ACCESS EXCLUSIVE` lock, briefly blocking reads/writes on `messages`. It cannot use
-`CREATE INDEX CONCURRENTLY`, because migrations run inside a transaction guarded by
-`pg_advisory_xact_lock` (see `migrations/env.py`) and `CONCURRENTLY` is not allowed inside a
-transaction. Acceptable on a small/empty table. On a large live table, build the index
-`CONCURRENTLY` out-of-band, then `ALTER TABLE ... ADD CONSTRAINT ... USING INDEX`.
-
-## Client-side follow-ups
-
-### Reconnect backoff / jitter
-The server exposes `last_seen_seq` replay but mandates no reconnect policy. A production client
-should reconnect with exponential backoff and jitter to avoid a thundering herd after a shared
-outage. Out of scope for the backend.
-
-## Operational notes
-
-### Migration strategy
-Prefer expand/contract for schema changes so old and new code can run against the same schema during
-a rolling deploy (add nullable column → backfill → enforce → drop, across separate releases).
-Concurrent replica boots all run `upgrade head`; `pg_advisory_xact_lock` serializes them, so later
-starters block, then find the schema already at head and no-op.
-
-Migration 0005 (`conversation_participants`) is expand-only and **backfills the owner of every
-existing conversation as its first participant**. That backfill is not cosmetic: access is now decided
-by membership, so without a row per conversation its own owner would lose the ability to connect,
-post, or read history. It has no `WHERE` clause, so soft-deleted conversations are backfilled too and
-stay restorable. Old code tolerates the new table, but new code requires it, so the table must exist
-before the new image serves traffic — which the boot-time `upgrade head` guarantees.
-
-### Security choices worth recording
-- **Refresh tokens are opaque** `<jti>.<secret>` strings; only a SHA-256 hash of the secret is
-  stored, so a database read cannot reconstruct a usable token.
-- **Access tokens are re-validated on every WebSocket send**, so an expired token can't keep sending
-  on an already-open socket.
-- **Password length is capped** (1024 chars) to bound argon2 CPU cost against a long-input DoS.
-- **CORS credentials** are enabled only for explicitly configured origins, never the `*` wildcard.
+- **Replay is unbounded.** A long-absent client can trigger an arbitrarily large replay on one socket.
+- **The rate limit is a fixed window.** A client that spends its quota at the end of one window and
+  the next window's immediately can send 2× the limit back to back.
+- **No streamed assistant reply, and no typing/presence** — the two nice-to-haves I skipped. The mock
+  returns one whole `message.new` rather than token chunks over the socket.
+- **A replica dying drops its sockets**, and Redis publish is fire-and-forget, so a message sent during
+  a Redis outage is persisted to Postgres but never fanned out live. Recovery is reconnect and refetch
+  either way — Postgres is the source of truth, Redis only the fan-out.
+- **`/metrics`, OAuth login, load-test numbers** — the three untaken bonuses; only one was allowed.

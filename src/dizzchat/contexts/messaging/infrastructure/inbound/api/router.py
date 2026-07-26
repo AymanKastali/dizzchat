@@ -19,8 +19,11 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.controllers import (
     rename_conversation,
     restore_conversation,
 )
+from dizzchat.shared.infrastructure.inbound.api.transactional_route import TransactionalRoute
 
-router = APIRouter(prefix="/conversations", tags=["conversations"])
+# ``route_class`` makes the request the transaction boundary for every route registered below, so a
+# write is durable before the client is told it happened.
+router = APIRouter(prefix="/conversations", tags=["conversations"], route_class=TransactionalRoute)
 router.add_api_route("", create_conversation, methods=["POST"], status_code=status.HTTP_201_CREATED)
 router.add_api_route("", list_conversations, methods=["GET"])
 router.add_api_route("/{conversation_id}", rename_conversation, methods=["PATCH"])

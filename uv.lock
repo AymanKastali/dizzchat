@@ -362,6 +362,7 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
     { name = "testcontainers", extra = ["redis"] },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -387,6 +388,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.24" },
     { name = "ruff", specifier = ">=0.8" },
     { name = "testcontainers", extras = ["redis"], specifier = ">=4.15.0" },
+    { name = "websockets", specifier = ">=14" },
 ]
 
 [[package]]
