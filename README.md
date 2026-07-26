@@ -1,5 +1,7 @@
 # dizzchat
 
+[![CI](https://github.com/AymanKastali/dizzchat/actions/workflows/ci.yml/badge.svg)](https://github.com/AymanKastali/dizzchat/actions/workflows/ci.yml)
+
 A real-time AI chat backend. Users sign up, open per-conversation WebSocket connections, and
 exchange messages with a bundled mock assistant that echoes the message back (`You said: …`) — no
 external LLM call.
@@ -10,7 +12,8 @@ replay, and are idempotent per client-supplied key.
 PostgreSQL · Redis pub/sub · JWT auth (argon2 password hashing) · Docker Compose.
 
 **Architecture:** a DDD hexagonal modular monolith with two bounded contexts — `identity` and
-`messaging` — plus a small shared kernel. See [Architecture](#architecture).
+`messaging` — plus a small shared kernel. See [Architecture](#architecture) below, or
+[SYSTEM_GUIDE.md](./SYSTEM_GUIDE.md) for a full deep-dive (design, decisions, flows, testing).
 
 ---
 
