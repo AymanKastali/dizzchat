@@ -313,6 +313,38 @@ class NoOpSubscriber:
     async def unsubscribe(self, conversation_id: ConversationId) -> None: ...
 
 
+class AllowAllRateLimiter:
+    """A ``RateLimiter`` that never limits, recording how many frames it was asked about."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def allow(self, user_id: UUID) -> bool:
+        self.calls += 1
+        return True
+
+
+class CountingRateLimiter:
+    """A ``RateLimiter`` allowing the first ``allow_first_n`` frames per user, then denying.
+
+    Counts per user id, so a test can show one sender exhausting their quota without affecting
+    anyone else. ``reset`` stands in for the window rolling over, optionally with a new allowance.
+    """
+
+    def __init__(self, allow_first_n: int) -> None:
+        self._allow_first_n = allow_first_n
+        self._seen: dict[UUID, int] = {}
+
+    async def allow(self, user_id: UUID) -> bool:
+        self._seen[user_id] = self._seen.get(user_id, 0) + 1
+        return self._seen[user_id] <= self._allow_first_n
+
+    def reset(self, allow_first_n: int | None = None) -> None:
+        if allow_first_n is not None:
+            self._allow_first_n = allow_first_n
+        self._seen.clear()
+
+
 class StubMessageReplayer:
     """A ``MessageReplayer`` that returns a preset list and records the cursor it was asked for."""
 

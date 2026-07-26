@@ -167,11 +167,14 @@ Settings load from env or `.env` via pydantic-settings; `get_settings()` is `@lr
 | `ACCESS_TOKEN_TTL_SECONDS` | int | `900` (15 min) |
 | `REFRESH_TOKEN_TTL_SECONDS` | int | `1209600` (14 days) |
 | `WS_AUTH_TIMEOUT_SECONDS` | float | `5.0` |
+| `WS_RATE_LIMIT_MESSAGES` | int | `20` — inbound frames allowed per user per window; `0` disables |
+| `WS_RATE_LIMIT_WINDOW_SECONDS` | int | `10` |
 | `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | float | `10.0` |
 | `CORS_ALLOW_ORIGINS` | list[str] | `[]` (JSON array; credentials only for explicit origins, never `*`) |
 
-> **Gotcha:** `WS_AUTH_TIMEOUT_SECONDS` and `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` exist in `config.py`
-> but are **not** listed in `.env.example`. They fall back to their defaults unless you set them.
+> **Gotcha:** `WS_AUTH_TIMEOUT_SECONDS`, the two `WS_RATE_LIMIT_*` knobs, and
+> `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` exist in `config.py` but are **not** listed in `.env.example`.
+> They fall back to their defaults unless you set them.
 > The `JWT_SECRET_KEY` in `docker-compose.yml` is a dev-only placeholder — inject a strong random
 > value anywhere real.
 
@@ -311,12 +314,14 @@ src/dizzchat/
         inbound/api/realtime/protocol.py     inbound frame models + outbound frame builders
         inbound/api/realtime/connection_manager.py  Connection + ConnectionManager (local delivery)
         inbound/api/realtime/conversation_registry.py ConversationSubscriber port + ConversationRegistry
+        inbound/api/realtime/rate_limit.py   RateLimiter port (declared beside its consumer)
         inbound/api/realtime/dependencies.py realtime DI wiring
         outbound/assistant/mock_assistant_responder.py  MockAssistantResponder ("You said: …")
         outbound/redis/channels.py            conversation_channel() -> "conv:{id}"
         outbound/redis/message_codec.py       encode/decode a domain Message <-> JSON bytes
         outbound/redis/redis_message_broadcaster.py  RedisMessageBroadcaster (PUBLISH only)
         outbound/redis/redis_conversation_subscriber.py RedisConversationSubscriber (per-replica reader)
+        outbound/redis/redis_rate_limiter.py  RedisRateLimiter (per-user fixed-window counter)
         outbound/identity/identity_user_directory.py  email -> user id (anti-corruption layer)
         outbound/persistence/models/          conversation_model, conversation_participant_model,
                                               message_model
@@ -498,7 +503,7 @@ replica — the publisher included — reads it back off Redis and writes it to 
 
 The six diagrams below walk through that step by step: the containers, what each replica builds at
 boot, what happens when a client connects, what a replica does with an inbound message, how that
-message reaches sockets on **both** replicas, and what teardown looks like. §8.1–8.5 cover the same
+message reaches sockets on **both** replicas, and what teardown looks like. §8.1–8.6 cover the same
 ground in prose, and the step index at the end links every numbered step to the code.
 
 #### A. Topology — what talks to what
@@ -700,13 +705,15 @@ error handlers → include routers in order: `health_router`, `identity_router`,
    (launches the background reader task). (Held as a local; reachable via the registry.)
 7. `RedisMessageBroadcaster(redis)` → `app.state.message_broadcaster`.
 8. `ConversationRegistry(connection_manager, subscriber)` → `app.state.conversation_registry`.
+9. `RedisRateLimiter(redis, SystemClock(), limit=…, window_seconds=…)` → `app.state.rate_limiter`
+   (same Redis client, a use unrelated to fan-out — see [§8.6](#86-rate-limiting)).
 
 On shutdown: drain sockets via `connection_manager.close_all()` bounded by
 `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` (a timeout is logged and swallowed), then `subscriber.stop()`,
 `redis.aclose()`, `engine.dispose()`.
 
 **`app.state` singletons:** `engine`, `session_factory`, `redis`, `connection_manager`,
-`message_broadcaster`, `conversation_registry`.
+`message_broadcaster`, `conversation_registry`, `rate_limiter`.
 
 ### 8.2 REST auth (`/auth`)
 
@@ -811,6 +818,10 @@ forbidden, `1011` internal; drain uses `1001`.
    message can slip through the gap — at the cost of ordering at the seam (see
    [§10](#10-delivery-guarantees)).
 8. **Receive loop** — per inbound frame:
+   - **Rate limit, before parsing** — `limiter.allow(sender_id.value)`. Over the limit →
+     `error("rate limit exceeded")`, keep the socket open, and the frame is never parsed, persisted,
+     broadcast, or shown to the assistant. The check comes *before* the JSON check precisely so an
+     unparseable flood costs quota too; see [§8.6](#86-rate-limiting).
    - non-JSON → send `error("invalid JSON")`, keep the socket open.
    - not a valid `message.send` / blank content → `error("invalid message frame")`, keep open.
    - **Re-validate the access token on every send** (`decode_access(token)` again). Expired → close
@@ -848,6 +859,31 @@ forbidden, `1011` internal; drain uses `1001`.
   So there's exactly one code path to a socket (`subscriber → ConnectionManager.broadcast`) and no
   double-delivery. This is *why* `join` awaits the subscribe before the receive loop starts — even
   the sender's own `message.new` echo depends on that subscription being live.
+
+### 8.6 Rate limiting
+
+`RedisRateLimiter` (`outbound/redis/redis_rate_limiter.py`) implements the `RateLimiter` port
+(`realtime/rate_limit.py`) — the *second*, independent use of Redis, unrelated to pub/sub.
+
+- **Algorithm** — fixed window. `window = int(clock.now().timestamp()) // window_seconds`, key
+  `ratelimit:ws:{user_id}:{window}`, then `INCR` + `EXPIRE` **in one transaction** (as two round
+  trips, a crash between them would leave a key with no TTL and lock that user out for good). Allowed
+  when the resulting count is `<= limit`.
+- **The window number is part of the key**, so each window has its own self-expiring key: no sweeper,
+  and re-applying the TTL can't slide the window forward and starve a busy client.
+- **Per user, shared across replicas.** Because the counter is in the Redis both replicas share, one
+  quota covers every socket that user holds on either instance. `tests/.../redis/test_redis_rate_limiter.py`
+  runs *two* limiter instances against one Redis to prove exactly that — a fake can't.
+- **Configuration** — `WS_RATE_LIMIT_MESSAGES` (default 20) per `WS_RATE_LIMIT_WINDOW_SECONDS`
+  (default 10). A limit of `0` disables the check and never touches Redis.
+- **Fails open** — any Redis error is logged at WARNING and the frame is allowed. A rate limit is a
+  protection, not an authorization rule. (Largely theoretical: `registry.join` already fails *closed*
+  with `1011` when Redis is down, so a socket can't reach the receive loop without Redis.)
+- **Wiring** — built once per replica in the lifespan (`app.state.rate_limiter`) and injected via
+  `provide_rate_limiter`, exactly like the broadcaster and the registry.
+
+Known flaw, accepted: a fixed window allows up to `2 * limit` frames back to back across a boundary.
+See [§15](#15-key-decisions--trade-offs).
 
 ---
 
@@ -952,6 +988,13 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
   revocation event; deliberately not built (see `NOTES.md`).
 - **Invited users are resolved, never asserted.** An invite names an email, which must belong to a
   registered user (`404` otherwise), so a mistyped identifier cannot become a phantom participant.
+- **Per-user rate limit on the socket.** Every inbound frame is counted in Redis against
+  `WS_RATE_LIMIT_MESSAGES` per window before it is parsed, so an authenticated client cannot spend the
+  server's DB/AI budget in a loop, and unparseable floods are capped too. It is keyed per **user**, so
+  extra sockets or the other replica grant no extra allowance. Two gaps to state plainly: it **fails
+  open** if Redis is unreachable (a protection, not an authorization rule), and the **REST endpoints
+  are not rate limited** — `/auth/login` in particular has no throttle, so nothing slows a
+  password-guessing loop. See [§8.6](#86-rate-limiting).
 - **Passwords:** argon2id (`Argon2PasswordHasher`), verified with the library's constant-time check;
   failures are swallowed to a boolean. Hashing always runs via `asyncio.to_thread` (off the loop).
 - **Anti-enumeration + timing defense** on login: malformed emails and missing users both yield the
@@ -1009,8 +1052,8 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 - **Layout mirrors the source.** `tests/` follows `contexts/{identity,messaging}` down through
   `domain/`, `application/`, `infrastructure/{api,security,redis}`, plus root `tests/test_health.py`
   and `tests/test_logging.py`.
-- **Scale.** 179 tests across 34 files. Heaviest: `test_conversation_routes.py` (24),
-  `test_websocket_routes.py` (15), `test_conversation.py` (15).
+- **Scale.** 190 tests across 35 files. Heaviest: `test_conversation_routes.py` (24),
+  `test_websocket_routes.py` (18), `test_conversation.py` (15).
 - **The multi-user proof.**
   `test_websocket_routes.py::test_a_message_from_one_user_is_broadcast_to_every_other_user_in_the_conversation`
   drives **two sockets authenticated as two different users** on one conversation and asserts both
@@ -1018,13 +1061,17 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 - **Fakes over infrastructure.** Almost every test uses in-memory fakes (`tests/contexts/*/fakes.py`)
   — fake repositories, hasher, token service, broadcaster, responder, `FixedClock`, etc. — so unit
   tests need no DB or network.
-- **One real-infra integration test.** `test_redis_fanout_integration.py` uses a real
-  `redis:7-alpine` via **testcontainers** (session-scoped fixture; `pytest.skip`s if Docker or
-  testcontainers is unavailable). It stands up **two independent replicas** (each a
-  `ConnectionManager` + `RedisConversationSubscriber` + `ConversationRegistry`) on one Redis and
-  asserts (a) a message published from replica A reaches a socket on replica B **and** loops back to
-  A's own socket via the same subscribe path, and (b) a replica only receives conversations it
-  subscribed to.
+- **Two real-infra integration suites**, both on a real `redis:7-alpine` via **testcontainers**
+  (session-scoped `redis_url` fixture; `pytest.skip`s if Docker or testcontainers is unavailable):
+  - `test_redis_fanout_integration.py` stands up **two independent replicas** (each a
+    `ConnectionManager` + `RedisConversationSubscriber` + `ConversationRegistry`) on one Redis and
+    asserts (a) a message published from replica A reaches a socket on replica B **and** loops back to
+    A's own socket via the same subscribe path, and (b) a replica only receives conversations it
+    subscribed to.
+  - `test_redis_rate_limiter.py` covers the counter against real Redis — allow-up-to-the-limit,
+    per-user isolation, window rollover (via an injected movable clock, so no sleeping), the key's
+    TTL, `limit=0` disabling the check, fail-open on an unreachable Redis, and **two limiter instances
+    sharing one quota**, which is the cross-replica claim a fake could not prove.
 - **WebSocket route tests** use Starlette's sync `TestClient.websocket_connect(...)` with
   `dependency_overrides` on the `provide_*` deps (fake writer/responder/broadcaster/token service),
   covering the happy path, all close codes, and the "error frame keeps the socket open" cases.
@@ -1053,6 +1100,13 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
   one caller (`RestoreConversation`) — an exception you can find by grep, rather than a boolean any
   future caller could flip. Restore is idempotent for the same reason `delete` is: an undo that
   fails on retry is the wrong shape.
+- **Rate limiting on the transport, in Redis, failing open.** The counter guards the socket (checked
+  in `_receive_loop` before parsing, so unparseable floods count too) rather than sitting inside
+  `MessageExchange`, where malformed frames would never reach it. It's keyed per user in shared Redis
+  so extra sockets or the other replica grant no extra allowance, answers with an `error` frame rather
+  than a `4429` close (a burst shouldn't cost a legitimate client its connection), and allows the
+  frame if Redis is unreachable — a protection, not an authorization rule. Accepted flaw: a fixed
+  window permits `2 * limit` across a boundary; a sliding window buys precision this doesn't need.
 
 **Deferred (production-hardening follow-ups, from `NOTES.md`):**
 - **Server-side exactly-once at the replay/live seam** — buffer live frames during replay and
@@ -1104,6 +1158,8 @@ A stricter server-side exactly-once/ordered option (buffer live frames during re
 - *How do delete and restore work?* → [§8.3](#83-conversations-rest-conversations) for both routes,
   [§6](#6-domain-model) for the idempotency rule, [§7](#7-database-schema) for `deleted_at`.
 - *What's the wire format?* → [§9](#9-real-time-protocol-reference); `realtime/protocol.py`.
+- *How is flooding prevented?* → [§8.6](#86-rate-limiting) for the algorithm and its wiring,
+  [§11](#11-security-model) for what it does and doesn't cover.
 - *What are the delivery guarantees?* → [§10](#10-delivery-guarantees).
 - *What's in the database?* → [§7](#7-database-schema); `migrations/versions/`.
 - *Where does X live in the code?* → [§5](#5-codebase-map).

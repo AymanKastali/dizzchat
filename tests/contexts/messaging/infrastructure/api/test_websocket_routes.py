@@ -45,9 +45,12 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.dependencie
     provide_message_broadcaster,
     provide_message_replayer,
     provide_message_writer,
+    provide_rate_limiter,
 )
 from tests.contexts.messaging.fakes import (
+    AllowAllRateLimiter,
     CannedAssistantResponder,
+    CountingRateLimiter,
     FailingAssistantResponder,
     FailingUserWriter,
     FakeMessageWriter,
@@ -109,6 +112,7 @@ def _build_app(
     responder: Any = None,
     access: Any = None,
     replayer: Any = None,
+    limiter: Any = None,
     settings: Settings | None = None,
 ) -> FastAPI:
     app = create_app()
@@ -129,6 +133,9 @@ def _build_app(
         manager, NoOpSubscriber()
     )
     app.dependency_overrides[provide_message_replayer] = lambda: replayer or StubMessageReplayer()
+    # Required, not optional: the real limiter is a lifespan singleton on ``app.state``, which does
+    # not exist here, so every socket would fail on the first frame without this override.
+    app.dependency_overrides[provide_rate_limiter] = lambda: limiter or AllowAllRateLimiter()
     if settings is not None:
         app.dependency_overrides[get_settings] = lambda: settings
     return app
@@ -392,3 +399,97 @@ def test_reconnect_with_an_up_to_date_cursor_replays_nothing() -> None:
     assert replayer.replayed_after == MessageId(5)
     assert live["type"] == "message.new"
     assert live["payload"]["content"] == "hi"
+
+
+def test_a_send_past_the_rate_limit_is_refused_with_an_error_frame() -> None:
+    writer = FakeMessageWriter()
+    app = _build_app(user_id=uuid4(), writer=writer, limiter=CountingRateLimiter(allow_first_n=1))
+
+    with TestClient(app).websocket_connect(_url(uuid4())) as ws:
+        ws.send_json(_auth_frame())
+        assert ws.receive_json() == {"type": "auth.ok"}
+
+        ws.send_json({"type": "message.send", "payload": {"content": "first"}})
+        for _ in range(3):  # message.new (user), message.new (assistant), message.ack
+            ws.receive_json()
+
+        ws.send_json({"type": "message.send", "payload": {"content": "second"}})
+        refused = ws.receive_json()
+
+    assert refused == {"type": "error", "error": "rate limit exceeded"}
+    # Only the allowed send was persisted: the refused frame reached neither the writer nor the
+    # assistant (whose canned reply is the second row).
+    assert [m.content.value for m in writer.written] == ["first", "You said: hi"]
+
+
+def test_the_socket_stays_usable_after_being_rate_limited() -> None:
+    limiter = CountingRateLimiter(allow_first_n=0)
+    app = _build_app(user_id=uuid4(), limiter=limiter)
+
+    with TestClient(app).websocket_connect(_url(uuid4())) as ws:
+        ws.send_json(_auth_frame())
+        assert ws.receive_json() == {"type": "auth.ok"}
+
+        ws.send_json({"type": "message.send", "payload": {"content": "too soon"}})
+        assert ws.receive_json() == {"type": "error", "error": "rate limit exceeded"}
+
+        # The window rolls over with a fresh allowance; the same socket sends again, having never
+        # had to reconnect.
+        limiter.reset(allow_first_n=1)
+        ws.send_json({"type": "message.send", "payload": {"content": "later"}})
+        frames = [ws.receive_json() for _ in range(3)]
+
+    assert [f["type"] for f in frames] == ["message.new", "message.new", "message.ack"]
+    assert frames[0]["payload"]["content"] == "later"
+
+
+def test_an_invalid_json_frame_is_reported_and_still_consumes_quota() -> None:
+    limiter = AllowAllRateLimiter()
+    app = _build_app(user_id=uuid4(), limiter=limiter)
+
+    with TestClient(app).websocket_connect(_url(uuid4())) as ws:
+        ws.send_json(_auth_frame())
+        assert ws.receive_json() == {"type": "auth.ok"}
+
+        ws.send_text("not json at all")
+        assert ws.receive_json() == {"type": "error", "error": "invalid JSON"}
+
+    # The auth frame is handled before the loop and is not counted; the garbage frame is, so a
+    # client cannot flood the socket with unparseable frames for free.
+    assert limiter.calls == 1
+
+
+def test_the_rate_limit_is_per_user_so_one_sender_cannot_silence_another() -> None:
+    alice, bob = uuid4(), uuid4()
+    app = _build_app(
+        user_id=alice,
+        tokens=FakeTokenService(alice, {_SECOND_USER_TOKEN: bob}),
+        limiter=CountingRateLimiter(allow_first_n=1),
+    )
+    conversation = uuid4()
+    client = TestClient(app)
+
+    with (
+        client.websocket_connect(_url(conversation)) as alice_ws,
+        client.websocket_connect(_url(conversation)) as bob_ws,
+    ):
+        alice_ws.send_json(_auth_frame())
+        assert alice_ws.receive_json() == {"type": "auth.ok"}
+        bob_ws.send_json(_auth_frame(token=_SECOND_USER_TOKEN))
+        assert bob_ws.receive_json() == {"type": "auth.ok"}
+
+        # Alice spends her single allowance, then is refused.
+        alice_ws.send_json({"type": "message.send", "payload": {"content": "one"}})
+        for _ in range(3):
+            alice_ws.receive_json()
+        for _ in range(2):  # bob sees both messages, but no ack of his own
+            bob_ws.receive_json()
+        alice_ws.send_json({"type": "message.send", "payload": {"content": "two"}})
+        assert alice_ws.receive_json() == {"type": "error", "error": "rate limit exceeded"}
+
+        # Bob's own quota is untouched by alice exhausting hers.
+        bob_ws.send_json({"type": "message.send", "payload": {"content": "three"}})
+        bob_frames = [bob_ws.receive_json() for _ in range(3)]
+
+    assert [f["type"] for f in bob_frames] == ["message.new", "message.new", "message.ack"]
+    assert bob_frames[0]["payload"]["content"] == "three"

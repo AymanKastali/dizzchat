@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     # How long a freshly-opened WebSocket has to send its auth frame before it is closed (4401).
     ws_auth_timeout_seconds: float = 5.0
 
+    # Per-user cap on inbound WebSocket frames, counted in Redis so it holds across every socket
+    # that user has open and every replica. ~2/s sustained: ample for a person typing, tight for a
+    # client in a loop. Set the limit to 0 to disable the check (used by the demo and the tests).
+    ws_rate_limit_messages: int = 20
+    ws_rate_limit_window_seconds: int = 10
+
     # Upper bound on the graceful-shutdown socket drain before the process exits anyway.
     shutdown_drain_timeout_seconds: float = 10.0
 

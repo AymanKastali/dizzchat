@@ -3,8 +3,8 @@
 Each leaf collaborator is injected separately so tests can override just the persistence, the mock
 AI, the access check, or the broadcaster while keeping local delivery working. Session-scoped
 adapters open one transaction per message / per access check, since a long-lived socket cannot
-reuse the request-scoped session. The broadcaster and the conversation registry are per-replica
-singletons created in the app lifespan and read from ``app.state``.
+reuse the request-scoped session. The broadcaster, the conversation registry, and the rate limiter
+are per-replica singletons created in the app lifespan and read from ``app.state``.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from dizzchat.contexts.messaging.application.services import MessageExchange
 from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.conversation_registry import (
     ConversationRegistry,
 )
+from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.rate_limit import RateLimiter
 from dizzchat.contexts.messaging.infrastructure.outbound.assistant import MockAssistantResponder
 from dizzchat.contexts.messaging.infrastructure.outbound.persistence import (
     SessionScopedConversationAccess,
@@ -40,6 +41,14 @@ def provide_message_broadcaster(websocket: WebSocket) -> MessageBroadcaster:
 
 
 MessageBroadcasterDep = Annotated[MessageBroadcaster, Depends(provide_message_broadcaster)]
+
+
+def provide_rate_limiter(websocket: WebSocket) -> RateLimiter:
+    limiter: RateLimiter = websocket.app.state.rate_limiter
+    return limiter
+
+
+RateLimiterDep = Annotated[RateLimiter, Depends(provide_rate_limiter)]
 
 
 def provide_conversation_registry(websocket: WebSocket) -> ConversationRegistry:
