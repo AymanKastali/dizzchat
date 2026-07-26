@@ -40,6 +40,22 @@ class OwnerId:
 
 
 @dataclass(frozen=True, eq=True, slots=True)
+class ParticipantId:
+    """A reference to an Identity user who takes part in a conversation.
+
+    Distinct from :class:`OwnerId` because the two name different roles: the owner administers the
+    conversation (rename, delete, invite), while participants may read and post. The owner is
+    always among the participants. Like ``OwnerId``, it references the user by identity only, so
+    this context stays decoupled from Identity.
+    """
+
+    value: UUID
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+
+@dataclass(frozen=True, eq=True, slots=True)
 class ConversationTitle:
     """A conversation title, trimmed and required to be non-empty."""
 

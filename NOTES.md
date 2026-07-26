@@ -6,11 +6,12 @@ what I cut, and the follow-ups a production hardening pass would pick up. Nothin
 ## How it's structured
 
 A DDD hexagonal modular monolith: one deployable run as two replicas, split into two bounded contexts —
-`identity` (users, JWT, argon2) and `messaging` (conversations, messages, **and** the real-time delivery
-layer) — plus a `shared/` kernel for clock, DB session factory, migration runner, Redis client, and
-`/health`. Each context repeats the same `domain / application / infrastructure(inbound|outbound)` shape,
-and the dependency arrow points inward: the domain imports no framework, and infrastructure depends on
-the core by implementing the ports the core declares.
+`identity` (users, JWT, argon2) and `messaging` (conversations, participants, messages, **and** the
+real-time delivery layer) — plus a `shared/` kernel for clock, DB session factory, migration runner,
+Redis client, and `/health`. Each context repeats the same
+`domain / application / infrastructure(inbound|outbound)` shape, and the dependency arrow points
+inward: the domain imports no framework, and infrastructure depends on the core by implementing the
+ports the core declares.
 
 Real-time lives *inside* `messaging` rather than in a third context, because delivery is *how* messages
 reach clients, not a separate domain — it shares the `Conversation`/`Message` aggregates, so splitting it
@@ -75,6 +76,51 @@ the sender.
 identity and order, so a client can't mismatch them.
 
 **No `typing`/presence frames.** A nice-to-have, cut — see below.
+
+## Multi-user conversations — the reading I changed my mind about
+
+The brief says users "**join conversations**" and that messages reach "all connected **clients** of a
+conversation". That reads two ways: several clients of *one* user (their phone, laptop, two tabs), or
+several *users* sharing a room. The four mandated sections say nothing either way — conversation REST
+is "create, list, rename, delete", with no invite or share endpoint.
+
+**I first built the single-user reading, then built the second.** Conversations now have a
+participant set: any participant may open a socket, send, and read history, while rename, delete, and
+the membership itself stay with the owner (who is a participant from creation and cannot be removed).
+
+What this cost is worth recording, because it is *less* than it looks: **the delivery path did not
+change at all.** `ConnectionManager` already keyed sockets by conversation rather than by user, and
+the Redis subscriber already re-broadcast to every replica's local sockets, so "all connected clients"
+was never single-user in the transport. The only thing standing in the way was the authorization
+gate — `ensure_owned_by` on connect, send, and history. That is now `ensure_participant`, plus one
+join table (`conversation_participants`, migration 0005) and three endpoints.
+
+**Membership is granted by the owner, by email** (`POST /conversations/{id}/participants`). Two
+alternatives were rejected:
+
+- **Self-service join** (`POST /conversations/{id}/join`, anyone with the id) — much less code, but
+  authorization degrades to "knows the UUID", which is a capability URL, not access control. That
+  sits badly against the brief's "no unauthenticated WebSocket access" constraint.
+- **Invite by user id** — no cross-context lookup needed, but nothing validates the user exists, so a
+  mistyped UUID becomes a silent phantom participant that can never connect.
+
+Resolving the email needs Messaging to ask Identity about a user it does not own. That goes through a
+`UserDirectory` port whose only implementation, `IdentityUserDirectory`, lives in
+`messaging/infrastructure/outbound/identity/`. It constructs Identity's `Email` and returns a bare
+`UUID`, so Identity's types never reach Messaging's domain or use cases — an anti-corruption layer,
+placed in infrastructure precisely because that is where cross-context coupling belongs.
+
+**The assistant still replies to every user message.** `MessageExchange` is untouched, so in a
+three-person room the mock answers all three. That matches the brief's AI-chat framing and kept the
+send path and its tests stable, but it is the wrong behaviour for real group chat; gating on an `@ai`
+mention is the small next step.
+
+**The honest gap: a removed participant keeps *receiving* until they disconnect.** Access is checked
+once, at connect, so revoking a membership does not close a socket that is already open. Their
+*sends* stop at once — `PostMessage` re-checks membership on every message, deliberately — and a
+reconnect is refused with `4403`. Closing live sockets on removal would need a cross-replica
+revocation event (a `participant.removed` publish that each replica turns into a close), which is
+real complexity for a case the assignment never raises. Not built, named here instead.
 
 ## An ambiguity I read differently
 
@@ -166,6 +212,13 @@ Prefer expand/contract for schema changes so old and new code can run against th
 a rolling deploy (add nullable column → backfill → enforce → drop, across separate releases).
 Concurrent replica boots all run `upgrade head`; `pg_advisory_xact_lock` serializes them, so later
 starters block, then find the schema already at head and no-op.
+
+Migration 0005 (`conversation_participants`) is expand-only and **backfills the owner of every
+existing conversation as its first participant**. That backfill is not cosmetic: access is now decided
+by membership, so without a row per conversation its own owner would lose the ability to connect,
+post, or read history. It has no `WHERE` clause, so soft-deleted conversations are backfilled too and
+stay restorable. Old code tolerates the new table, but new code requires it, so the table must exist
+before the new image serves traffic — which the boot-time `upgrade head` guarantees.
 
 ### Security choices worth recording
 - **Refresh tokens are opaque** `<jti>.<secret>` strings; only a SHA-256 hash of the secret is

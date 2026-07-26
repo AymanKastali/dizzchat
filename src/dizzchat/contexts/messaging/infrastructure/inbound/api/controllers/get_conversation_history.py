@@ -8,7 +8,7 @@ from uuid import UUID
 from fastapi import Query
 
 from dizzchat.contexts.identity.infrastructure.inbound.api.dependencies import CurrentUser
-from dizzchat.contexts.messaging.domain.conversation import ConversationId, OwnerId
+from dizzchat.contexts.messaging.domain.conversation import ConversationId, ParticipantId
 from dizzchat.contexts.messaging.domain.message import MessageId
 from dizzchat.contexts.messaging.infrastructure.inbound.api.dependencies import (
     GetConversationHistoryDep,
@@ -25,7 +25,7 @@ async def get_conversation_history(
 ) -> MessagePageResponse:
     page = await service.execute(
         conversation_id=ConversationId(conversation_id),
-        owner_id=OwnerId(caller.user_id.value),
+        participant_id=ParticipantId(caller.user_id.value),
         before=MessageId(before) if before is not None else None,
         limit=limit,
     )

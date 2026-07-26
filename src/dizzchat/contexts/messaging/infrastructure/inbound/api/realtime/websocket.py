@@ -23,8 +23,8 @@ from dizzchat.contexts.identity.infrastructure.inbound.api.dependencies import (
 from dizzchat.contexts.messaging.domain.conversation import (
     ConversationId,
     ConversationNotFound,
-    NotConversationOwner,
-    OwnerId,
+    NotConversationParticipant,
+    ParticipantId,
 )
 from dizzchat.contexts.messaging.domain.message import (
     ClientMessageId,
@@ -78,10 +78,10 @@ async def conversation_ws(
         claims, token, last_seen_seq = authenticated
 
         conversation = ConversationId(conversation_id)
-        owner_id = OwnerId(claims.user_id.value)
+        participant_id = ParticipantId(claims.user_id.value)
         try:
-            await access.ensure(conversation_id=conversation, owner_id=owner_id)
-        except (ConversationNotFound, NotConversationOwner):
+            await access.ensure(conversation_id=conversation, participant_id=participant_id)
+        except (ConversationNotFound, NotConversationParticipant):
             await websocket.close(code=_FORBIDDEN_CLOSE)
             return
 

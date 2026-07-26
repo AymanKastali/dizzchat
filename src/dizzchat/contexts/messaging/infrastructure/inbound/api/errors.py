@@ -6,16 +6,22 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
 from dizzchat.contexts.messaging.domain.conversation import (
+    CannotRemoveConversationOwner,
     ConversationNotFound,
     InvalidConversationTitle,
     NotConversationOwner,
+    NotConversationParticipant,
+    ParticipantUserNotFound,
 )
 from dizzchat.contexts.messaging.domain.errors import MessagingError
 from dizzchat.contexts.messaging.domain.message import InvalidMessageContent
 
 _STATUS_BY_ERROR: dict[type[MessagingError], int] = {
     ConversationNotFound: status.HTTP_404_NOT_FOUND,
+    ParticipantUserNotFound: status.HTTP_404_NOT_FOUND,
     NotConversationOwner: status.HTTP_403_FORBIDDEN,
+    NotConversationParticipant: status.HTTP_403_FORBIDDEN,
+    CannotRemoveConversationOwner: status.HTTP_409_CONFLICT,
     InvalidConversationTitle: status.HTTP_422_UNPROCESSABLE_CONTENT,
     InvalidMessageContent: status.HTTP_422_UNPROCESSABLE_CONTENT,
 }

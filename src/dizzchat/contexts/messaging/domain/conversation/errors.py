@@ -24,3 +24,32 @@ class NotConversationOwner(MessagingError):
 
     def __init__(self) -> None:
         super().__init__("conversation is owned by another user")
+
+
+class NotConversationParticipant(MessagingError):
+    """Raised when a caller reads from or posts to a conversation they do not take part in."""
+
+    def __init__(self) -> None:
+        super().__init__("caller is not a participant of this conversation")
+
+
+class ParticipantUserNotFound(MessagingError):
+    """Raised when an invited email belongs to no registered user.
+
+    A Messaging error rather than an Identity one: the failure is "this conversation cannot add
+    that participant", so translating it here keeps the context's error surface self-contained.
+    """
+
+    def __init__(self, email: str) -> None:
+        super().__init__(f"no registered user for email: {email}")
+
+
+class CannotRemoveConversationOwner(MessagingError):
+    """Raised when removing the owner from their own conversation.
+
+    The owner is a participant by construction; removing them would leave a conversation its own
+    owner could neither read nor post to while still being able to rename and delete it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("the conversation owner cannot be removed")

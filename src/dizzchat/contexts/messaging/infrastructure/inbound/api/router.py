@@ -9,10 +9,13 @@ from __future__ import annotations
 from fastapi import APIRouter, status
 
 from dizzchat.contexts.messaging.infrastructure.inbound.api.controllers import (
+    add_participant,
     create_conversation,
     delete_conversation,
     get_conversation_history,
     list_conversations,
+    list_participants,
+    remove_participant,
     rename_conversation,
 )
 
@@ -27,3 +30,16 @@ router.add_api_route(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 router.add_api_route("/{conversation_id}/messages", get_conversation_history, methods=["GET"])
+router.add_api_route(
+    "/{conversation_id}/participants",
+    add_participant,
+    methods=["POST"],
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+router.add_api_route("/{conversation_id}/participants", list_participants, methods=["GET"])
+router.add_api_route(
+    "/{conversation_id}/participants/{user_id}",
+    remove_participant,
+    methods=["DELETE"],
+    status_code=status.HTTP_204_NO_CONTENT,
+)

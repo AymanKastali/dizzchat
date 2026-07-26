@@ -25,7 +25,7 @@ from dizzchat.contexts.identity.infrastructure.inbound.api.dependencies import g
 from dizzchat.contexts.messaging.domain.conversation import (
     ConversationId,
     ConversationNotFound,
-    NotConversationOwner,
+    NotConversationParticipant,
 )
 from dizzchat.contexts.messaging.domain.message import (
     Message,
@@ -56,18 +56,24 @@ from tests.contexts.messaging.fakes import (
 )
 
 _VALID_TOKEN = "valid-token"
+_SECOND_USER_TOKEN = "valid-token-2"
 
 
 class FakeTokenService:
-    """Decodes only ``_VALID_TOKEN``, to a fixed user; anything else is rejected."""
+    """Decodes ``_VALID_TOKEN`` to ``user_id``, plus any ``extra`` token→user pairs.
 
-    def __init__(self, user_id: UUID) -> None:
-        self._user_id = user_id
+    ``extra`` is what lets one app authenticate two *different* users, so a test can put two
+    people in the same conversation.
+    """
+
+    def __init__(self, user_id: UUID, extra: dict[str, UUID] | None = None) -> None:
+        self._by_token = {_VALID_TOKEN: user_id, **(extra or {})}
 
     def decode_access(self, token: str) -> AccessClaims:
-        if token != _VALID_TOKEN:
+        user_id = self._by_token.get(token)
+        if user_id is None:
             raise InvalidAccessToken()
-        return AccessClaims(user_id=UserId(self._user_id))
+        return AccessClaims(user_id=UserId(user_id))
 
 
 class ExpiringTokenService:
@@ -171,6 +177,40 @@ def test_send_persists_broadcasts_and_returns_the_assistant_reply() -> None:
     assert [m.content.value for m in writer.written] == ["hi", "You said: hi"]
 
 
+def test_a_message_from_one_user_is_broadcast_to_every_other_user_in_the_conversation() -> None:
+    """The multi-user requirement, end to end through the socket layer.
+
+    Two *different* authenticated users join one conversation, and a message either of them sends
+    reaches both. Alice additionally gets her own ``message.ack``, which Bob does not.
+    """
+    alice, bob = uuid4(), uuid4()
+    app = _build_app(user_id=alice, tokens=FakeTokenService(alice, {_SECOND_USER_TOKEN: bob}))
+    conversation = uuid4()
+    client = TestClient(app)
+
+    with (
+        client.websocket_connect(_url(conversation)) as alice_ws,
+        client.websocket_connect(_url(conversation)) as bob_ws,
+    ):
+        alice_ws.send_json(_auth_frame())
+        assert alice_ws.receive_json() == {"type": "auth.ok"}
+        bob_ws.send_json(_auth_frame(token=_SECOND_USER_TOKEN))
+        assert bob_ws.receive_json() == {"type": "auth.ok"}
+
+        alice_ws.send_json({"type": "message.send", "payload": {"content": "hi"}})
+
+        alice_frames = [alice_ws.receive_json() for _ in range(3)]
+        bob_frames = [bob_ws.receive_json() for _ in range(2)]
+
+    # Bob sees Alice's message and the assistant reply, but never an ack for a send he didn't make.
+    assert [(f["type"], f["payload"]["content"]) for f in bob_frames] == [
+        ("message.new", "hi"),
+        ("message.new", "You said: hi"),
+    ]
+    assert [f["type"] for f in alice_frames] == ["message.new", "message.new", "message.ack"]
+    assert [f["payload"]["sender_id"] for f in bob_frames] == [str(alice), None]
+
+
 def test_a_bad_token_closes_with_4401() -> None:
     app = _build_app(user_id=uuid4())
     with (
@@ -204,8 +244,8 @@ def test_a_missing_auth_frame_times_out_and_closes_with_4401() -> None:
     assert disconnect.value.code == 4401
 
 
-def test_access_to_another_users_conversation_closes_with_4403() -> None:
-    app = _build_app(user_id=uuid4(), access=FakeConversationAccess(NotConversationOwner()))
+def test_access_to_a_conversation_you_are_not_in_closes_with_4403() -> None:
+    app = _build_app(user_id=uuid4(), access=FakeConversationAccess(NotConversationParticipant()))
     with (
         pytest.raises(WebSocketDisconnect) as disconnect,
         TestClient(app).websocket_connect(_url(uuid4())) as ws,

@@ -16,28 +16,36 @@ from dizzchat.contexts.identity.infrastructure.inbound.api.authenticated_user im
 )
 from dizzchat.contexts.identity.infrastructure.inbound.api.dependencies import get_current_user
 from dizzchat.contexts.messaging.application.services import (
+    AddParticipant,
     CreateConversation,
     DeleteConversation,
     GetConversationHistory,
     ListConversations,
+    ListParticipants,
+    RemoveParticipant,
     RenameConversation,
 )
 from dizzchat.contexts.messaging.domain.conversation import (
     ConversationId,
     ConversationTitle,
     OwnerId,
+    ParticipantId,
 )
 from dizzchat.contexts.messaging.domain.message import MessageContent, MessageRole, SenderId
 from dizzchat.contexts.messaging.infrastructure.inbound.api.dependencies import (
+    provide_add_participant,
     provide_create_conversation,
     provide_delete_conversation,
     provide_get_conversation_history,
     provide_list_conversations,
+    provide_list_participants,
+    provide_remove_participant,
     provide_rename_conversation,
 )
 from tests.contexts.messaging.fakes import (
     FakeConversationRepository,
     FakeMessageRepository,
+    FakeUserDirectory,
     FixedClock,
 )
 
@@ -50,9 +58,16 @@ def _build_app(
     caller_id: UUID,
     *,
     authenticated: bool,
+    users: FakeUserDirectory | None = None,
 ) -> FastAPI:
     app = create_app()
     clock = FixedClock(_NOW)
+    directory = users if users is not None else FakeUserDirectory()
+    app.dependency_overrides[provide_add_participant] = lambda: AddParticipant(
+        conversations, directory, clock
+    )
+    app.dependency_overrides[provide_list_participants] = lambda: ListParticipants(conversations)
+    app.dependency_overrides[provide_remove_participant] = lambda: RemoveParticipant(conversations)
     app.dependency_overrides[provide_create_conversation] = lambda: CreateConversation(
         conversations, clock
     )
@@ -79,6 +94,7 @@ class _Context:
     conversations: FakeConversationRepository
     messages: FakeMessageRepository
     caller_id: UUID
+    users: FakeUserDirectory
 
 
 @pytest.fixture
@@ -86,10 +102,11 @@ async def ctx() -> AsyncIterator[_Context]:
     conversations = FakeConversationRepository()
     messages = FakeMessageRepository()
     caller_id = uuid4()
-    app = _build_app(conversations, messages, caller_id, authenticated=True)
+    users = FakeUserDirectory()
+    app = _build_app(conversations, messages, caller_id, authenticated=True, users=users)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield _Context(client, conversations, messages, caller_id)
+        yield _Context(client, conversations, messages, caller_id, users)
 
 
 async def _seed_conversation(
@@ -102,6 +119,7 @@ async def _seed_conversation(
         title=ConversationTitle("seeded"),
         created_at=_NOW,
         updated_at=_NOW,
+        participant_ids=frozenset({ParticipantId(owner_id)}),
     )
     return conversation_id
 
@@ -196,6 +214,135 @@ async def test_history_is_cursor_paginated(ctx: _Context) -> None:
     assert [m["content"] for m in second_body["items"]] == ["m1", "m0"]
     assert second_body["has_more"] is False
     assert second_body["next_cursor"] is None
+
+
+async def test_history_for_someone_who_is_not_a_participant_is_forbidden(ctx: _Context) -> None:
+    conversation_id = await _seed_conversation(ctx.conversations, owner_id=uuid4())
+
+    response = await ctx.client.get(f"/conversations/{conversation_id}/messages")
+
+    assert response.status_code == 403
+
+
+async def test_owner_adds_a_participant_who_can_then_read_the_conversation(
+    ctx: _Context,
+) -> None:
+    created = await ctx.client.post("/conversations", json={"title": "room"})
+    conversation_id = created.json()["id"]
+    guest = uuid4()
+    ctx.users.register("guest@example.com", guest)
+
+    added = await ctx.client.post(
+        f"/conversations/{conversation_id}/participants", json={"email": "guest@example.com"}
+    )
+    assert added.status_code == 204
+
+    listed = await ctx.client.get(f"/conversations/{conversation_id}/participants")
+    assert listed.status_code == 200
+    assert {p["user_id"] for p in listed.json()} == {str(ctx.caller_id), str(guest)}
+
+
+async def test_adding_the_same_participant_twice_is_idempotent(ctx: _Context) -> None:
+    created = await ctx.client.post("/conversations", json={"title": "room"})
+    conversation_id = created.json()["id"]
+    ctx.users.register("guest@example.com", uuid4())
+    body = {"email": "guest@example.com"}
+
+    first = await ctx.client.post(f"/conversations/{conversation_id}/participants", json=body)
+    second = await ctx.client.post(f"/conversations/{conversation_id}/participants", json=body)
+
+    assert (first.status_code, second.status_code) == (204, 204)
+    listed = await ctx.client.get(f"/conversations/{conversation_id}/participants")
+    assert len(listed.json()) == 2  # the owner plus one guest, not two guest rows
+
+
+async def test_adding_an_unregistered_email_is_not_found(ctx: _Context) -> None:
+    created = await ctx.client.post("/conversations", json={"title": "room"})
+    conversation_id = created.json()["id"]
+
+    response = await ctx.client.post(
+        f"/conversations/{conversation_id}/participants", json={"email": "nobody@example.com"}
+    )
+
+    assert response.status_code == 404
+
+
+async def test_only_the_owner_may_add_a_participant(ctx: _Context) -> None:
+    conversation_id = await _seed_conversation(ctx.conversations, owner_id=uuid4())
+    ctx.users.register("guest@example.com", uuid4())
+
+    response = await ctx.client.post(
+        f"/conversations/{conversation_id}/participants", json={"email": "guest@example.com"}
+    )
+
+    assert response.status_code == 403
+
+
+async def test_owner_removes_a_participant(ctx: _Context) -> None:
+    created = await ctx.client.post("/conversations", json={"title": "room"})
+    conversation_id = created.json()["id"]
+    guest = uuid4()
+    ctx.users.register("guest@example.com", guest)
+    await ctx.client.post(
+        f"/conversations/{conversation_id}/participants", json={"email": "guest@example.com"}
+    )
+
+    removed = await ctx.client.delete(f"/conversations/{conversation_id}/participants/{guest}")
+
+    assert removed.status_code == 204
+    listed = await ctx.client.get(f"/conversations/{conversation_id}/participants")
+    assert [p["user_id"] for p in listed.json()] == [str(ctx.caller_id)]
+
+
+async def test_a_participant_may_remove_themselves(ctx: _Context) -> None:
+    owner_id = uuid4()
+    conversation_id = await _seed_conversation(ctx.conversations, owner_id=owner_id)
+    await ctx.conversations.add_participant(
+        conversation_id=conversation_id,
+        participant_id=ParticipantId(ctx.caller_id),
+        joined_at=_NOW,
+    )
+
+    response = await ctx.client.delete(
+        f"/conversations/{conversation_id}/participants/{ctx.caller_id}"
+    )
+
+    assert response.status_code == 204
+
+
+async def test_removing_someone_else_without_owning_the_conversation_is_forbidden(
+    ctx: _Context,
+) -> None:
+    other = uuid4()
+    conversation_id = await _seed_conversation(ctx.conversations, owner_id=uuid4())
+    await ctx.conversations.add_participant(
+        conversation_id=conversation_id, participant_id=ParticipantId(other), joined_at=_NOW
+    )
+
+    response = await ctx.client.delete(f"/conversations/{conversation_id}/participants/{other}")
+
+    assert response.status_code == 403
+
+
+async def test_removing_the_owner_is_a_conflict(ctx: _Context) -> None:
+    created = await ctx.client.post("/conversations", json={"title": "room"})
+    conversation_id = created.json()["id"]
+
+    response = await ctx.client.delete(
+        f"/conversations/{conversation_id}/participants/{ctx.caller_id}"
+    )
+
+    assert response.status_code == 409
+
+
+async def test_listing_participants_of_a_conversation_you_are_not_in_is_forbidden(
+    ctx: _Context,
+) -> None:
+    conversation_id = await _seed_conversation(ctx.conversations, owner_id=uuid4())
+
+    response = await ctx.client.get(f"/conversations/{conversation_id}/participants")
+
+    assert response.status_code == 403
 
 
 async def test_routes_require_authentication() -> None:

@@ -13,7 +13,8 @@ model.
 
 **Scope:** all core requirements + the highest-signal nice-to-haves (cursor pagination, soft-delete,
 graceful shutdown, cross-instance fan-out test) + **one** bonus: **message delivery guarantees**
-(client-`message_id` dedupe + at-least-once redelivery on reconnect).
+(client-`message_id` dedupe + at-least-once redelivery on reconnect). A conversation holds **many
+participants**, so a message from any of them is broadcast to all of them, on any replica.
 
 **Toolchain:** `uv` (deps/venv) · `ruff` (lint + format) · `mypy` (types) · `pytest` +
 `pytest-asyncio` (tests).
@@ -32,11 +33,16 @@ requirement without microservice overhead.
 
 ### Bounded contexts / subdomain map
 - **Identity** (supporting) — users, signup/login, JWT access + refresh, password hashing.
-- **Messaging** (**core**) — conversation CRUD + message persistence/history **and** the realtime
-  layer: the WebSocket endpoint, connection lifecycle, Redis pub/sub fan-out, delivery guarantees.
-  Conversations and realtime share the `Conversation`/`Message` aggregates, so they live in one
-  context rather than being split behind an artificial boundary. Where the differentiating effort
-  goes.
+- **Messaging** (**core**) — conversation CRUD, membership, and message persistence/history **and**
+  the realtime layer: the WebSocket endpoint, connection lifecycle, Redis pub/sub fan-out, delivery
+  guarantees. Conversations and realtime share the `Conversation`/`Message` aggregates, so they live
+  in one context rather than being split behind an artificial boundary. Where the differentiating
+  effort goes.
+- **The one cross-context dependency** — admitting a participant by email needs Messaging to resolve
+  an Identity user. That goes through a `UserDirectory` port implemented by `IdentityUserDirectory`
+  in `messaging/infrastructure/outbound/identity/`: an anti-corruption layer that constructs
+  Identity's `Email` and hands back a bare `UUID`, so Identity's types never reach Messaging's
+  domain or use cases.
 - **Shared kernel** (`shared/`) — clock, database/session factory, migration runner, Redis client,
   and the `/health` endpoint: cross-context technical concerns with no domain of their own.
 
@@ -128,10 +134,21 @@ domain.
 ### Data model (Alembic-managed)
 - `users` (id, email unique, password_hash, created_at)
 - `conversations` (id, owner_id, title, created_at, updated_at, deleted_at nullable → soft-delete)
+- `conversation_participants` (conversation_id, user_id, joined_at; composite PK on
+  `(conversation_id, user_id)` so a user cannot be admitted twice; indexed on `user_id` for
+  "conversations I'm in")
 - `messages` (id `bigserial` = the ordering key, conversation_id, sender_id nullable for assistant,
   role `user|assistant`, content, client_message_id nullable, created_at; unique
   `(conversation_id, client_message_id)`)
 - refresh tokens: store hashed token / jti for rotation + revocation.
+
+### Access control — two levels, one aggregate
+`conversations.owner_id` names the administrator; `conversation_participants` names who may take part.
+`Conversation` enforces both itself: `ensure_participant` gates joining the live channel, sending,
+and reading history, while `ensure_owned_by` gates rename, delete, and membership changes. The owner
+is seeded as a participant by `Conversation.start` and cannot be removed, so a conversation can never
+end up with an owner locked out of it. Membership is re-checked on **every** send, not only at
+connect, so revoking it stops a user posting immediately.
 
 ### Alternatives considered (ruled out)
 - **Microservices (auth / chat / gateway):** operational overhead unjustified; monolith-as-replicas
@@ -141,6 +158,10 @@ domain.
   separation.
 - **Auth token via query param (primary):** ends up in access logs; kept only as a documented
   fallback.
+- **Self-service conversation join** (any authenticated user joins any conversation whose id they
+  know): cheapest way to get multiple users into a room, but it reduces authorization to a capability
+  URL. Membership is owner-granted by email instead — argued in
+  [NOTES.md § Multi-user conversations](./NOTES.md#multi-user-conversations--the-reading-i-changed-my-mind-about).
 
 ---
 

@@ -34,5 +34,8 @@ class CreateConversation:
             title=conversation.title,
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
+            # Seeded by ``start`` with the owner, so a new conversation is immediately usable by
+            # the person who created it.
+            participant_ids=conversation.participant_ids,
         )
         return conversation
