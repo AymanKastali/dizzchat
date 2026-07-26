@@ -400,30 +400,74 @@ With the stack up, from a second terminal:
 uv run demo.py
 ```
 
+It prints **every HTTP call and every WebSocket frame as it happens**, with a short explanation of
+what each step is demonstrating, so the JSON protocol and the cross-replica hop are visible rather
+than summarised. Nine steps, following the brief's sequence — sign up → open a socket → send →
+broadcast + assistant reply → reconnect → history — plus the two-replica Redis bonus and an
+idempotent resend. Abridged:
+
 ```
-dizzchat demo · the assignment's deliverable 5, end to end
-replica A http://localhost:8000   replica B http://localhost:8001
+================================================================================================
+ dizzchat — a live walkthrough of the running stack
+================================================================================================
+Two API replicas run behind one Postgres and one Redis. Everything below is real traffic
+against them, printed as it happens.
 
-  1  health          localhost:8000 and localhost:8001 both report ok
-  2  signup          alice-d90e34d2@demo.dizzchat created (201)
-  3  read-your-write login on the same connection, zero delay -> 200
-  4  conversation    "demo" created, id 35b7250d-7d1e-4aa8-8131-6cc3968f6f81
-  5  connect         auth.ok on localhost:8000
-  6  send            ack seq=31 · message.new user + assistant "You said: hello"
-  7  two replicas    alice sent on localhost:8000; bob received it on localhost:8001 via Redis
-  8  reconnect       last_seen_seq=0 on localhost:8001 replayed seq [31, 32, 33, 34]
-  9  history         GET /messages returned 4 messages, newest first
- 10  idempotent      same client_message_id -> ack seq=31, history still 4
+   replica A   http://localhost:8000
+   replica B   http://localhost:8001
 
-10/10 steps passed
+   →  sent by this script        ←  received from the server
+
+────────────────────────────────────────────────────────────────────────────────────────────────
+STEP 5 · Send a message, and see the broadcast and the assistant reply
+────────────────────────────────────────────────────────────────────────────────────────────────
+  One send produces three frames back. The ack confirms it and carries the server-assigned
+  id; the user message is then broadcast to every client in the conversation; and the mock
+  assistant's reply is persisted and broadcast the same way. That id doubles as the sequence
+  number used for ordering and replay.
+
+  →  {"type": "message.send", "payload": {"content": "hello", "client_message_id": "274c5392-…"}}
+  ←  {"type": "message.ack", "payload": {"id": 9, "client_message_id": "274c5392-…", …}}
+  ←  {"type": "message.new", "payload": {"id": 9, "sender_id": "b50a7610-…", "role": "user",
+       "content": "hello", …}}
+  ←  {"type": "message.new", "payload": {"id": 10, "sender_id": null, "role": "assistant",
+       "content": "You said: hello", …}}
+     ✓ acked as seq 9, then broadcast back with role=user
+     ✓ the assistant replied "You said: hello" as seq 10, persisted like any other message
+
+────────────────────────────────────────────────────────────────────────────────────────────────
+STEP 6 · The cross-replica hop, through Redis   ← the bonus the brief asks for
+────────────────────────────────────────────────────────────────────────────────────────────────
+  Bob is invited, then connects to replica B while alice keeps sending on replica A. Nothing
+  in replica A's memory can reach a socket held by replica B, so the message has to travel: A
+  persists it, publishes it to this conversation's Redis channel, B's subscriber picks it up,
+  and B writes it to bob's socket.
+
+  alice sends, on replica A (localhost:8000):
+  →  {"type": "message.send", "payload": {"content": "hello bob", …}}
+
+  bob receives, on replica B (localhost:8001) — these crossed Redis to get here:
+  ←  {"type": "message.new", "payload": {"id": 11, "role": "user", "content": "hello bob", …}}
+  ←  {"type": "message.new", "payload": {"id": 12, "role": "assistant",
+       "content": "You said: hello bob", …}}
+     ✓ a message sent to localhost:8000 reached a socket held by localhost:8001 — the Redis
+       fan-out working across instances
+
+… steps 7–9: reconnect with last_seen_seq=0 and replay, read the same history over REST,
+  then resend a duplicate client_message_id and watch it change nothing …
+
+================================================================================================
+ done — 9 steps, 12 assertions, all passed. Nothing was mocked; this was the real stack.
+================================================================================================
 ```
 
-Every step asserts something and the exit code is non-zero if any fails, so it is a smoke test as
-well as a demo. There is nothing to install: a [PEP 723](https://peps.python.org/pep-0723/) header
+Every step asserts what it claims and the exit code is non-zero if any fails, so it is a smoke test
+as well as a demo. There is nothing to install: a [PEP 723](https://peps.python.org/pep-0723/) header
 declares its one dependency and `uv run` fetches it into a throwaway environment — no `uv sync`, no
-project virtualenv. HTTP goes over a single keep-alive connection on purpose, which is what makes
-step 3 meaningful (see [Known issues](#known-issues)). Fresh emails are generated per run, so it is
-re-runnable against a live database.
+project virtualenv. HTTP goes over a single keep-alive connection on purpose, so the sign-up-then-log-
+in in step 2 leaves no delay for a not-yet-durable write to hide behind (see
+[Known issues](#known-issues)). Fresh emails are generated per run, so it is re-runnable against a
+live database.
 
 It also ships inside the image, if you would rather not have `uv` on the host:
 
@@ -561,8 +605,9 @@ thing this section exists for:
   intermittent `401 invalid credentials` on sign-up-then-log-in. The transaction boundary is now
   `TransactionalRoute`, which commits before the response goes out; the ordering is asserted at the
   raw ASGI level in `tests/shared/infrastructure/api/test_transactional_route.py`, and `demo.py`
-  step 3 exercises it live over one keep-alive connection. Full write-up in
-  [NOTES.md](./NOTES.md#rest-writes-were-acknowledged-before-they-were-durable).
+  step 3 exercises it live over one keep-alive connection. Why a route class rather than a commit in
+  each controller, and the boot guard that stops a router from silently losing its commit:
+  [SYSTEM_GUIDE.md § 8.2](./SYSTEM_GUIDE.md#82-rest-auth-auth).
 
 Everything in the next section is a deliberate scope decision, not a defect.
 
