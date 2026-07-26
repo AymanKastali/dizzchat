@@ -308,3 +308,32 @@ To see **idempotent send**, send the same `client_message_id` twice — the seco
 `message.ack` (no new row, no re-broadcast). To see **reconnect replay**, reconnect with
 `"last_seen_seq": 0` in the `auth` payload and observe the missed `message.new` frames replayed in
 order — including cross-replica, by connecting the second time to `ws://localhost:8001`.
+
+---
+
+## Scope & deliberate cuts
+
+Everything in the assignment's four "must build" sections is implemented. The items below are
+conscious scope decisions — optional *nice-to-haves*, the untaken bonuses, or documented nuances of
+features that already meet spec — not defects. Each production follow-up is recorded in `NOTES.md`.
+
+- **No conversation restore.** Delete is a soft-delete (`deleted_at`); there is no restore endpoint,
+  and reads filter deleted rows out. (Soft-delete and cursor pagination — the two Req-2
+  nice-to-haves — *are* built.)
+- **Reconnect replay is at-least-once and unordered at the live/replay seam.** This is the bonus as
+  specified ("at-least-once redelivery on reconnect"). Because the socket joins live delivery before
+  replay runs (so nothing is missed), a live frame can arrive ahead of a lower-`seq` replay frame.
+  The client applies each `seq` at most once (a seen-set) and orders by the `id` each frame carries;
+  there is no server-side exactly-once buffering.
+- **Replay is unbounded.** `last_seen_seq` replays the full tail with no page/deadline cap, so a
+  long-absent client can trigger a large replay. Production would cap it and fall back to the REST
+  history endpoint past a threshold.
+- **No streamed assistant reply, typing indicators/presence, or per-user rate limiting.** All three
+  are optional Req-3 nice-to-haves; the mock returns a single `message.new` (`"You said: …"`).
+- **One bonus taken — delivery guarantees.** The assignment asks for at most one; no `/metrics`
+  (Prometheus), OAuth login, or load-test harness.
+- **Correlation ids cover the WebSocket path.** Each connection tags its log lines with a
+  `connection_id`; REST requests are not yet correlated.
+- **Migrations run automatically on each replica's boot,** serialized by a Postgres advisory lock
+  (later starters find the schema at head and no-op). Fine at this scale; a large live table would
+  want out-of-band index builds — see `NOTES.md`.

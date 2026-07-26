@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
@@ -47,6 +47,7 @@ from dizzchat.contexts.messaging.infrastructure.inbound.api.realtime.protocol im
     AuthFrame,
     SendMessageFrame,
 )
+from dizzchat.logging import connection_id_var
 
 logger = logging.getLogger(__name__)
 
@@ -67,48 +68,56 @@ async def conversation_ws(
 ) -> None:
     await websocket.accept()
 
-    authenticated = await _authenticate(websocket, tokens, settings.ws_auth_timeout_seconds)
-    if authenticated is None:
-        return
-    claims, token, last_seen_seq = authenticated
-
-    conversation = ConversationId(conversation_id)
-    owner_id = OwnerId(claims.user_id.value)
+    # Correlation id for every log line emitted while serving this socket. Reset on exit so the
+    # id never leaks to a task whose context is reused.
+    cid_token = connection_id_var.set(uuid4().hex)
     try:
-        await access.ensure(conversation_id=conversation, owner_id=owner_id)
-    except (ConversationNotFound, NotConversationOwner):
-        await websocket.close(code=_FORBIDDEN_CLOSE)
-        return
+        authenticated = await _authenticate(websocket, tokens, settings.ws_auth_timeout_seconds)
+        if authenticated is None:
+            return
+        claims, token, last_seen_seq = authenticated
 
-    connection = Connection(websocket)
-    await connection.send(protocol.auth_ok())
-    try:
-        await registry.join(conversation, connection)
-    except Exception:
-        # The fan-out subscription could not be established (e.g. Redis is down): fail closed
-        # rather than serve a socket that would silently miss cross-replica messages. join() has
-        # already rolled back its local registration, so there is nothing to leave.
-        logger.exception("failed to join conversation for fan-out")
-        await connection.close(code=_INTERNAL_ERROR_CLOSE)
-        return
+        conversation = ConversationId(conversation_id)
+        owner_id = OwnerId(claims.user_id.value)
+        try:
+            await access.ensure(conversation_id=conversation, owner_id=owner_id)
+        except (ConversationNotFound, NotConversationOwner):
+            await websocket.close(code=_FORBIDDEN_CLOSE)
+            return
 
-    sender_id = SenderId(claims.user_id.value)
-    try:
-        # Join above turned on live delivery, so no message can be missed (no gap). Replay then
-        # re-sends everything past the client's cursor. Delivery is at-least-once and NOT ordered at
-        # the seam: a live broadcast (always a higher seq, being newer) can interleave ahead of a
-        # lower-seq replay frame. The client must apply each seq at most once (a seen-set, not a
-        # high-water mark, which would drop the later lower-seq frames) and order by the seq each
-        # frame carries as ``id``.
-        await _replay_missed(connection, replayer, conversation, last_seen_seq)
-        await _receive_loop(websocket, connection, conversation, sender_id, exchange, tokens, token)
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        logger.exception("error while serving the conversation socket")
-        await connection.close(code=_INTERNAL_ERROR_CLOSE)
+        connection = Connection(websocket)
+        await connection.send(protocol.auth_ok())
+        try:
+            await registry.join(conversation, connection)
+        except Exception:
+            # The fan-out subscription could not be established (e.g. Redis is down): fail closed
+            # rather than serve a socket that would silently miss cross-replica messages. join() has
+            # already rolled back its local registration, so there is nothing to leave.
+            logger.exception("failed to join conversation for fan-out")
+            await connection.close(code=_INTERNAL_ERROR_CLOSE)
+            return
+
+        sender_id = SenderId(claims.user_id.value)
+        try:
+            # Join above turned on live delivery, so no message can be missed (no gap). Replay
+            # then re-sends everything past the client's cursor. Delivery is at-least-once and
+            # NOT ordered at the seam: a live broadcast (always a higher seq, being newer) can
+            # interleave ahead of a lower-seq replay frame. The client must apply each seq at most
+            # once (a seen-set, not a high-water mark, which would drop the later lower-seq frames)
+            # and order by the seq each frame carries as ``id``.
+            await _replay_missed(connection, replayer, conversation, last_seen_seq)
+            await _receive_loop(
+                websocket, connection, conversation, sender_id, exchange, tokens, token
+            )
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            logger.exception("error while serving the conversation socket")
+            await connection.close(code=_INTERNAL_ERROR_CLOSE)
+        finally:
+            await registry.leave(conversation, connection)
     finally:
-        await registry.leave(conversation, connection)
+        connection_id_var.reset(cid_token)
 
 
 async def _authenticate(
